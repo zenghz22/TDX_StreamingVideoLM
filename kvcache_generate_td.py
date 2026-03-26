@@ -22,6 +22,14 @@ def _build_encode_text(encode_prefix):
     return VIDEO_PLACEHOLDER
 
 
+
+
+def _get_cache_seq_len(kv_cache):
+    try:
+        return int(kv_cache[0][0].shape[-2])
+    except Exception:
+        return 0
+
 def load_model(model_name="llava-hf/llava-onevision-qwen2-7b-ov-hf", load_weights=False):
     """加载 processor；可选加载模型权重。"""
     processor = LlavaOnevisionProcessor.from_pretrained(model_name)
@@ -117,7 +125,17 @@ def encode_video(video, processor, model=None, chunk_size=64, encode_prefix=ENCO
             for k, v in model_inputs.items()
         }
 
+        past_seq_len = _get_cache_seq_len(kv_cache)
+        current_seq_len = model_inputs["input_ids"].shape[1]
+        if past_seq_len > 0:
+            model_inputs["attention_mask"] = torch.ones(
+                (model_inputs["input_ids"].shape[0], past_seq_len + current_seq_len),
+                dtype=model_inputs["attention_mask"].dtype,
+                device=device,
+            )
+
         print(f"[chunk {i}] encode_text: {repr(encode_text)}")
+        print(f"[chunk {i}] past_seq_len: {past_seq_len}, current_seq_len: {current_seq_len}")
         for k, v in model_inputs.items():
             if isinstance(v, torch.Tensor):
                 print(f"[chunk {i}] model_inputs[{k}] shape: {tuple(v.shape)}")
