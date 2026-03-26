@@ -44,6 +44,15 @@ def _build_decode_suffix(question):
     return "\n问题：" + question + "\n回答："
 
 
+def _get_past_seq_len(kv_cache, metadata):
+    if metadata.get("past_seq_len") is not None:
+        return int(metadata["past_seq_len"])
+    try:
+        return int(kv_cache[0][0].shape[-2])
+    except Exception:
+        return 0
+
+
 def decode_kvcache(
     kv_cache_path,
     question,
@@ -72,9 +81,20 @@ def decode_kvcache(
     model_inputs = processor(text=[suffix], return_tensors="pt")
     model_inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in model_inputs.items()}
 
+    past_seq_len = _get_past_seq_len(kv_cache, metadata)
+    current_seq_len = model_inputs["input_ids"].shape[1]
+    full_attention_mask = torch.ones(
+        (model_inputs["input_ids"].shape[0], past_seq_len + current_seq_len),
+        dtype=model_inputs["attention_mask"].dtype,
+        device=device,
+    )
+    model_inputs["attention_mask"] = full_attention_mask
+
     for k, v in model_inputs.items():
         if isinstance(v, torch.Tensor):
             print(f"decode model_inputs[{k}] shape: {tuple(v.shape)}")
+
+    print(f"decode past_seq_len: {past_seq_len}, current_seq_len: {current_seq_len}")
 
     with torch.no_grad():
         outputs = model(
@@ -96,8 +116,14 @@ def decode_kvcache(
         generated_token_ids.append(int(next_token.item()))
 
         for step_idx in range(max_new_tokens - 1):
+            step_attention_mask = torch.ones(
+                (1, past_seq_len + current_seq_len + len(generated)),
+                dtype=model_inputs["attention_mask"].dtype,
+                device=device,
+            )
             step_outputs = model(
                 input_ids=next_token,
+                attention_mask=step_attention_mask,
                 past_key_values=past,
                 use_cache=True,
                 return_dict=True,
