@@ -100,7 +100,7 @@ def encode_video(video, processor, model=None, chunk_size=64, encode_prefix=ENCO
     for i in range(num_chunks):
         chunk = video[i * chunk_size : min((i + 1) * chunk_size, num_frames)]
         if stage_mark is not None:
-            stage_mark(f"chunk_{i}_start")
+            stage_mark(f"chunk_{i}_start")        
 
         pixel_values = processor.video_processor(chunk, return_tensors="pt").pixel_values_videos.to("cpu")
         print(f"[chunk {i}] pixel_values_videos shape: {tuple(pixel_values.shape)}")
@@ -109,8 +109,6 @@ def encode_video(video, processor, model=None, chunk_size=64, encode_prefix=ENCO
             kv_cache.append({"chunk_index": i, "pixel_values_shape": tuple(pixel_values.shape)})
             continue
 
-        # 关键修复：避免每个 chunk 都重复注入完整 ENCODE_PREFIX，
-        # 否则 KV 会被模板文本淹没，解码时容易复读前缀。
         if i == 0:
             encode_text = _build_encode_text(encode_prefix)
         else:
@@ -142,8 +140,8 @@ def encode_video(video, processor, model=None, chunk_size=64, encode_prefix=ENCO
             if isinstance(v, torch.Tensor):
                 print(f"[chunk {i}] model_inputs[{k}] shape: {tuple(v.shape)}")
 
-        if stage_mark is not None:
-            stage_mark(f"chunk_{i}_prefill_start")
+        #if stage_mark is not None:
+        #    stage_mark(f"chunk_{i}_prefill_start")
 
         with torch.no_grad():
             outputs = model(
@@ -153,8 +151,8 @@ def encode_video(video, processor, model=None, chunk_size=64, encode_prefix=ENCO
                 return_dict=True,
             )
 
-        if stage_mark is not None:
-            stage_mark(f"chunk_{i}_prefill_end")
+        #if stage_mark is not None:
+        #    stage_mark(f"chunk_{i}_prefill_end")
 
         kv_cache = outputs.past_key_values
 
@@ -163,8 +161,8 @@ def encode_video(video, processor, model=None, chunk_size=64, encode_prefix=ENCO
             first_layer_v = kv_cache[0][1]
             print(f"[chunk {i}] kv_cache layer0 key shape: {tuple(first_layer_k.shape)}")
             print(f"[chunk {i}] kv_cache layer0 value shape: {tuple(first_layer_v.shape)}")
-
-        if stage_mark is not None:
-            stage_mark(f"chunk_{i}_end")
+   
+        #if stage_mark is not None:
+        #    stage_mark(f"chunk_{i}_end")
 
     return kv_cache

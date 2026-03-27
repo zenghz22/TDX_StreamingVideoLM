@@ -66,7 +66,7 @@ def _forward_pre_hook_model(model, args, kwargs):
         is_prefill = input_ids.shape[1] > 1
 
     model._current_stage = "prefill" if is_prefill else "decode"
-    _emit_event(model, f"model_{model._current_stage}_start")
+    #_emit_event(model, f"model_{model._current_stage}_start")
 
 
 def _forward_hook_model(model, args, kwargs, outputs):
@@ -77,22 +77,19 @@ def _forward_hook_model(model, args, kwargs, outputs):
         model._timing["model_prefill_time_us"] = elapsed_us
         model._timing["first_step_time_us"] = elapsed_us
         model._timing["model_prefill_calls"] += 1
-        _emit_event(model, "model_prefill_end", {"elapsed_us": elapsed_us})
     else:
         model._timing["model_decode_total_us"] += elapsed_us
         model._timing["model_decode_calls"] += 1
-        _emit_event(model, "model_decode_end", {"elapsed_us": elapsed_us})
+    #_emit_event(model, f"model_{model._current_stage}_end", {"elapsed_us": elapsed_us})
 
 
 def _forward_pre_hook_visual(model, inputs):
     model._start_time_ns = time.perf_counter_ns()
     if inputs:
         model._encoder_inputs_shape = tuple(inputs[0].shape)
-
     parent = getattr(model, "_timing_parent", None)
     stage = getattr(parent, "_current_stage", "prefill") if parent is not None else "prefill"
-    _emit_event(model, f"visual_{stage}_start")
-
+    _emit_event(model, f"visual_start")
 
 def _forward_hook_visual(model, inputs, outputs):
     end_ns = time.perf_counter_ns()
@@ -109,11 +106,9 @@ def _forward_hook_visual(model, inputs, outputs):
             model._encoder_output_shape = tuple(outputs.shape)
         except Exception:
             model._encoder_output_shape = None
-
     parent = getattr(model, "_timing_parent", None)
     stage = getattr(parent, "_current_stage", "prefill") if parent is not None else "prefill"
-    _emit_event(model, f"visual_{stage}_end", {"elapsed_us": elapsed_us})
-
+    _emit_event(model, f"visual_end", {"elapsed_us": elapsed_us})
 
 def _forward_pre_hook_llm(model, inputs):
     model._start_time_ns = time.perf_counter_ns()

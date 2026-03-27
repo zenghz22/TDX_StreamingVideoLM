@@ -1,3 +1,4 @@
+import sys
 import logging
 import os
 import threading
@@ -174,23 +175,31 @@ def plot_resource_usage(stats, output_file, task_name="Task"):
     for idx, event in enumerate(events):
         t = event.get("t", 0.0)
         label = event.get("label", "event")
-        color = "#2ca02c" if "prefill" in label else "#9467bd"
+        color = "#2cc411"
+        if "prefill" in label:
+            color = "#ab23cd"
+        if "visual" in label:
+            color = "#EDBE33"
+        if "load" in label:
+            color = "#b01318"
+        y = 0.98
+        if  "prefill" in label:
+            y = 0.65
+        if  "visual" in label:
+            y = 0.3
+        ax.axvline(t, color=color, linestyle=":", linewidth=3, alpha=0.8)
 
-        ax.axvline(t, color=color, linestyle=":", linewidth=1.2, alpha=0.8)
-
-        # 标签过多时稀疏显示，避免遮挡
-        if idx < 14 or idx % 3 == 0:
-            ax.text(
-                t,
-                ax.get_ylim()[1] * (0.98 - (idx % 5) * 0.07),
-                label,
-                rotation=90,
-                fontsize=8,
-                va="top",
-                ha="right",
-                color=color,
-                alpha=0.9,
-            )
+        ax.text(
+            t,
+            ax.get_ylim()[1] * y,
+            label,
+            rotation=90,
+            fontsize=15,
+            va="top",
+            ha="right",
+            color=color,
+            alpha=0.9,
+        )
 
     system_info = get_system_info()
     system_text = (
@@ -203,7 +212,7 @@ def plot_resource_usage(stats, output_file, task_name="Task"):
         0.01,
         system_text,
         ha="center",
-        fontsize=10,
+        fontsize=15,
         bbox=dict(facecolor="lightgray", alpha=0.3),
     )
 
