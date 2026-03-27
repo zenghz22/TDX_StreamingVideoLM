@@ -5,6 +5,7 @@ import sys
 from kvcache_generate_td import ENCODE_PREFIX, encode_video, load_model, load_video, save_kv_cache
 from kvcache_retrieve_td import decode_kvcache
 from zhz_hardware_eval_utils import log_system_info, measure_resources
+from zhz_model_eval_utils import inject_timing_hook_to_model, print_timing_stats, remove_timing_hooks_from_model
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,10 +30,20 @@ if __name__ == "__main__":
     print("Video loaded successfully.")
 
     with measure_resources("Encode Video", logger=logger, plot_file="Encode Video.png") as monitor:
+        inject_timing_hook_to_model(model, event_callback=monitor["mark"])
+        monitor["mark"]("encode_begin")
         kv_cache = encode_video(video, processor, model=model, encode_prefix=ENCODE_PREFIX)
+        monitor["mark"]("encode_end")
         print("Preprocess done.")
         save_kv_cache(kv_cache, kv_cache_path, model=model, extra_metadata={"encode_prefix": ENCODE_PREFIX})
+        print_timing_stats(model)
+        remove_timing_hooks_from_model()
 
     with measure_resources("Decode KVcache", logger=logger, plot_file="Decode KVcache.png") as monitor:
+        inject_timing_hook_to_model(model, event_callback=monitor["mark"])
+        monitor["mark"]("decode_begin")
         answer = decode_kvcache(kv_cache_path, question, processor, model)
+        monitor["mark"]("decode_end")
         print("Answer:", answer)
+        print_timing_stats(model)
+        remove_timing_hooks_from_model()

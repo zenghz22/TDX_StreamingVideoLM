@@ -33,6 +33,7 @@ class ResourceMonitor:
         self.timestamps = []
         self.memory_usages = []
         self.monitoring = True
+        self.events = []
 
         self.timestamps.append(0.0)
         self.cpu_percentages.append(0.0)
@@ -55,6 +56,14 @@ class ResourceMonitor:
             self.cpu_percentages.append(self.process.cpu_percent(interval=None))
             self.memory_usages.append(self.process.memory_info().rss / 1024 / 1024)
 
+    def mark_event(self, label, payload=None):
+        if not self.monitoring:
+            return
+        if payload is None:
+            payload = {}
+        t = time.time() - self.start_time
+        self.events.append({"t": t, "label": str(label), "payload": payload})
+
     def get_results(self):
         if self.start_time is None or self.end_time is None:
             raise RuntimeError("监控尚未开始或已停止")
@@ -74,6 +83,7 @@ class ResourceMonitor:
             "timestamps": self.timestamps,
             "cpu_percentages": self.cpu_percentages,
             "memory_usages": self.memory_usages,
+            "events": self.events,
         }
 
 
@@ -95,7 +105,7 @@ def measure_resources(name="Task", interval=0.1, logger=None, plot_file=None):
     sampling_thread.daemon = True
     sampling_thread.start()
 
-    results = {"monitor": monitor, "stats": None}
+    results = {"monitor": monitor, "stats": None, "mark": monitor.mark_event}
 
     try:
         yield results
@@ -176,6 +186,30 @@ def plot_resource_usage(stats, output_file, task_name="Task"):
         verticalalignment="top",
         bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="#d62728"),
     )
+
+    # 绘制阶段事件标记线（例如 chunk/prefill/decode 事件）。
+    events = stats.get("events", [])
+    for idx, event in enumerate(events):
+        t = event.get("t", 0.0)
+        label = event.get("label", "event")
+        color = "#2ca02c" if "prefill" in label else "#9467bd"
+
+        ax1.axvline(t, color=color, linestyle=":", linewidth=1.2, alpha=0.8)
+        ax2.axvline(t, color=color, linestyle=":", linewidth=1.2, alpha=0.8)
+
+        # 标签过多时稀疏显示，避免遮挡。
+        if idx < 12 or idx % 3 == 0:
+            ax1.text(
+                t,
+                ax1.get_ylim()[1] * (0.98 - (idx % 4) * 0.08),
+                label,
+                rotation=90,
+                fontsize=8,
+                va="top",
+                ha="right",
+                color=color,
+                alpha=0.9,
+            )
 
     system_info = get_system_info()
     system_text = (
