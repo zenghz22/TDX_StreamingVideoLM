@@ -34,7 +34,12 @@ def _init_timing_state(model):
 
 
 def _emit_event(model, label, payload=None):
+    # 顶层 model 直接取 callback；子模块（vision/llm）则回溯到 _timing_parent。
     cb = getattr(model, "_timing_event_cb", None)
+    if cb is None:
+        parent = getattr(model, "_timing_parent", None)
+        if parent is not None:
+            cb = getattr(parent, "_timing_event_cb", None)
     if cb is None:
         return
     if payload is None:
@@ -84,6 +89,10 @@ def _forward_pre_hook_visual(model, inputs):
     if inputs:
         model._encoder_inputs_shape = tuple(inputs[0].shape)
 
+    parent = getattr(model, "_timing_parent", None)
+    stage = getattr(parent, "_current_stage", "prefill") if parent is not None else "prefill"
+    _emit_event(model, f"visual_{stage}_start")
+
 
 def _forward_hook_visual(model, inputs, outputs):
     end_ns = time.perf_counter_ns()
@@ -100,6 +109,10 @@ def _forward_hook_visual(model, inputs, outputs):
             model._encoder_output_shape = tuple(outputs.shape)
         except Exception:
             model._encoder_output_shape = None
+
+    parent = getattr(model, "_timing_parent", None)
+    stage = getattr(parent, "_current_stage", "prefill") if parent is not None else "prefill"
+    _emit_event(model, f"visual_{stage}_end", {"elapsed_us": elapsed_us})
 
 
 def _forward_pre_hook_llm(model, inputs):
