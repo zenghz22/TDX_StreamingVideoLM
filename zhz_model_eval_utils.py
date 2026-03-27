@@ -25,6 +25,10 @@ def _init_timing_state(model):
     model.vision_tower._start_time_ns = 0
     model.language_model._start_time_ns = 0
 
+    # 子模块 hook 里需要回写到顶层 model 的统计字典。
+    model.vision_tower._timing_parent = model
+    model.language_model._timing_parent = model
+
     model.vision_tower._encoder_inputs_shape = None
     model.vision_tower._encoder_output_shape = None
 
@@ -91,11 +95,15 @@ def _forward_hook_llm(model, inputs, outputs):
     end_ns = time.perf_counter_ns()
     elapsed_us = (end_ns - model._start_time_ns) / 1000.0
 
-    if not getattr(model, "_prefill_done", False):
-        model._timing["llm_prefill_time_us"] = elapsed_us
+    parent = getattr(model, "_timing_parent", None)
+    if parent is None:
+        return
+
+    if not getattr(parent, "_prefill_done", False):
+        parent._timing["llm_prefill_time_us"] = elapsed_us
     else:
-        model._timing["llm_decode_total_us"] += elapsed_us
-        model._timing["llm_decode_calls"] += 1
+        parent._timing["llm_decode_total_us"] += elapsed_us
+        parent._timing["llm_decode_calls"] += 1
 
 
 def inject_timing_hook_to_model(model, event_callback=None):
