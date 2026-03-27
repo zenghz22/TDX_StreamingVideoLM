@@ -133,75 +133,56 @@ def measure_resources(name="Task", interval=0.1, logger=None, plot_file=None):
 
 
 def plot_resource_usage(stats, output_file, task_name="Task"):
-    """绘制资源使用曲线图。"""
+    """绘制资源使用曲线图（仅 memory 图）。"""
     matplotlib.use("Agg")
 
     output_dir = os.path.dirname(output_file)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    fig, ax = plt.subplots(1, 1, figsize=(12, 6))
 
-    ax1.plot(stats["timestamps"], stats["cpu_percentages"], "b-", linewidth=2)
-    ax1.set_xlabel("Time (seconds)", fontsize=12)
-    ax1.set_ylabel("CPU Usage (%)", color="b", fontsize=12)
-    ax1.set_title(f"{task_name} - CPU Usage", fontsize=14)
-    ax1.grid(True, linestyle="--", alpha=0.7)
-    ax1.tick_params(axis="y", labelcolor="b")
-    ax1.yaxis.set_major_locator(MaxNLocator(integer=True))
+    # 仅绘制内存曲线
+    ax.plot(stats["timestamps"], stats["memory_usages"], "r-", linewidth=2)
+    ax.set_xlabel("Time (seconds)", fontsize=12)
+    ax.set_ylabel("Memory Usage (MB)", color="r", fontsize=12)
+    ax.set_title(f"{task_name} - Memory Usage", fontsize=14)
+    ax.grid(True, linestyle="--", alpha=0.7)
+    ax.tick_params(axis="y", labelcolor="r")
 
-    cpu_text = (
+    # 将 CPU + Memory 统计信息统一放在 memory 图中
+    summary_text = (
         f"Execution time: {stats['duration']:.2f} seconds\n"
         f"Avg CPU: {stats['avg_cpu_percent']:.2f}%\n"
-        f"Peak CPU: {stats['max_cpu_percent']:.2f}%"
-    )
-    ax1.text(
-        0.68,
-        0.12,
-        cpu_text,
-        transform=ax1.transAxes,
-        fontsize=10,
-        verticalalignment="top",
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="#1f77b4"),
-    )
-
-    ax2.plot(stats["timestamps"], stats["memory_usages"], "r-", linewidth=2)
-    ax2.set_xlabel("Time (seconds)", fontsize=12)
-    ax2.set_ylabel("Memory Usage (MB)", color="r", fontsize=12)
-    ax2.set_title(f"{task_name} - Memory Usage", fontsize=14)
-    ax2.grid(True, linestyle="--", alpha=0.7)
-    ax2.tick_params(axis="y", labelcolor="r")
-
-    memory_text = (
+        f"Peak CPU: {stats['max_cpu_percent']:.2f}%\n"
         f"Initial memory: {stats['memory_initial_mb']:.2f} MB\n"
         f"Final memory: {stats['memory_final_mb']:.2f} MB\n"
         f"Memory increase: {stats['memory_used_mb']:.2f} MB"
     )
-    ax2.text(
-        0.68,
+    ax.text(
+        0.66,
         0.12,
-        memory_text,
-        transform=ax2.transAxes,
+        summary_text,
+        transform=ax.transAxes,
         fontsize=10,
         verticalalignment="top",
         bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="#d62728"),
     )
 
-    # 绘制阶段事件标记线（例如 chunk/prefill/decode 事件）。
+    # 将所有阶段标线和标签都绘制在 memory 图中
     events = stats.get("events", [])
     for idx, event in enumerate(events):
         t = event.get("t", 0.0)
         label = event.get("label", "event")
         color = "#2ca02c" if "prefill" in label else "#9467bd"
 
-        ax1.axvline(t, color=color, linestyle=":", linewidth=1.2, alpha=0.8)
-        ax2.axvline(t, color=color, linestyle=":", linewidth=1.2, alpha=0.8)
+        ax.axvline(t, color=color, linestyle=":", linewidth=1.2, alpha=0.8)
 
-        # 标签过多时稀疏显示，避免遮挡。
-        if idx < 12 or idx % 3 == 0:
-            ax1.text(
+        # 标签过多时稀疏显示，避免遮挡
+        if idx < 14 or idx % 3 == 0:
+            ax.text(
                 t,
-                ax1.get_ylim()[1] * (0.98 - (idx % 4) * 0.08),
+                ax.get_ylim()[1] * (0.98 - (idx % 5) * 0.07),
                 label,
                 rotation=90,
                 fontsize=8,
