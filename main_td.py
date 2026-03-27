@@ -32,7 +32,9 @@ if __name__ == "__main__":
     with measure_resources("Encode Video", logger=logger, plot_file="Encode Video.png") as monitor:
         inject_timing_hook_to_model(model, event_callback=monitor["mark"])
         monitor["mark"]("encode_begin")
-        kv_cache = encode_video(video, processor, model=model, encode_prefix=ENCODE_PREFIX)
+        kv_cache = encode_video(
+            video, processor, model=model, encode_prefix=ENCODE_PREFIX, stage_mark=monitor["mark"]
+        )
         monitor["mark"]("encode_end")
         print("Preprocess done.")
         save_kv_cache(kv_cache, kv_cache_path, model=model, extra_metadata={"encode_prefix": ENCODE_PREFIX})

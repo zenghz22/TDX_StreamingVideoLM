@@ -91,7 +91,7 @@ def save_kv_cache(kv_cache, kv_cache_path, model=None, extra_metadata=None):
     print(f"KV metadata: {metadata}")
 
 
-def encode_video(video, processor, model=None, chunk_size=64, encode_prefix=ENCODE_PREFIX):
+def encode_video(video, processor, model=None, chunk_size=64, encode_prefix=ENCODE_PREFIX, stage_mark=None):
     """将视频分块编码成 KV cache。"""
     kv_cache = []
     num_frames = video.shape[0]
@@ -99,6 +99,8 @@ def encode_video(video, processor, model=None, chunk_size=64, encode_prefix=ENCO
 
     for i in range(num_chunks):
         chunk = video[i * chunk_size : min((i + 1) * chunk_size, num_frames)]
+        if stage_mark is not None:
+            stage_mark(f"chunk_{i}_start")
 
         pixel_values = processor.video_processor(chunk, return_tensors="pt").pixel_values_videos.to("cpu")
         print(f"[chunk {i}] pixel_values_videos shape: {tuple(pixel_values.shape)}")
@@ -140,6 +142,9 @@ def encode_video(video, processor, model=None, chunk_size=64, encode_prefix=ENCO
             if isinstance(v, torch.Tensor):
                 print(f"[chunk {i}] model_inputs[{k}] shape: {tuple(v.shape)}")
 
+        if stage_mark is not None:
+            stage_mark(f"chunk_{i}_prefill_start")
+
         with torch.no_grad():
             outputs = model(
                 **model_inputs,
@@ -148,6 +153,9 @@ def encode_video(video, processor, model=None, chunk_size=64, encode_prefix=ENCO
                 return_dict=True,
             )
 
+        if stage_mark is not None:
+            stage_mark(f"chunk_{i}_prefill_end")
+
         kv_cache = outputs.past_key_values
 
         if kv_cache:
@@ -155,5 +163,8 @@ def encode_video(video, processor, model=None, chunk_size=64, encode_prefix=ENCO
             first_layer_v = kv_cache[0][1]
             print(f"[chunk {i}] kv_cache layer0 key shape: {tuple(first_layer_k.shape)}")
             print(f"[chunk {i}] kv_cache layer0 value shape: {tuple(first_layer_v.shape)}")
+
+        if stage_mark is not None:
+            stage_mark(f"chunk_{i}_end")
 
     return kv_cache

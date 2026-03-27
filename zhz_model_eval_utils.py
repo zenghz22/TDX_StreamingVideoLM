@@ -20,7 +20,7 @@ def _init_timing_state(model):
     model._timing_event_cb = None
 
     model._start_time_ns = 0
-    model._prefill_done = False
+    model._current_stage = "prefill"
 
     model.vision_tower._start_time_ns = 0
     model.language_model._start_time_ns = 0
@@ -42,21 +42,36 @@ def _emit_event(model, label, payload=None):
     cb(label, payload)
 
 
-def _forward_pre_hook_model(model, inputs):
+def _forward_pre_hook_model(model, args, kwargs):
     model._start_time_ns = time.perf_counter_ns()
-    stage = "decode" if model._prefill_done else "prefill"
-    _emit_event(model, f"model_{stage}_start")
+
+    input_ids = kwargs.get("input_ids")
+    pixel_values_videos = kwargs.get("pixel_values_videos")
+
+    # 兼容某些版本 hooks kwargs 为空时，从 args 兜底推断。
+    if input_ids is None and args:
+        first_arg = args[0]
+        if getattr(first_arg, "shape", None) is not None:
+            input_ids = first_arg
+
+    is_prefill = False
+    if pixel_values_videos is not None:
+        is_prefill = True
+    elif input_ids is not None and getattr(input_ids, "shape", None) is not None:
+        is_prefill = input_ids.shape[1] > 1
+
+    model._current_stage = "prefill" if is_prefill else "decode"
+    _emit_event(model, f"model_{model._current_stage}_start")
 
 
-def _forward_hook_model(model, inputs, outputs):
+def _forward_hook_model(model, args, kwargs, outputs):
     end_ns = time.perf_counter_ns()
     elapsed_us = (end_ns - model._start_time_ns) / 1000.0
 
-    if not model._prefill_done:
+    if model._current_stage == "prefill":
         model._timing["model_prefill_time_us"] = elapsed_us
         model._timing["first_step_time_us"] = elapsed_us
         model._timing["model_prefill_calls"] += 1
-        model._prefill_done = True
         _emit_event(model, "model_prefill_end", {"elapsed_us": elapsed_us})
     else:
         model._timing["model_decode_total_us"] += elapsed_us
@@ -99,7 +114,7 @@ def _forward_hook_llm(model, inputs, outputs):
     if parent is None:
         return
 
-    if not getattr(parent, "_prefill_done", False):
+    if getattr(parent, "_current_stage", "prefill") == "prefill":
         parent._timing["llm_prefill_time_us"] = elapsed_us
     else:
         parent._timing["llm_decode_total_us"] += elapsed_us
@@ -116,8 +131,8 @@ def inject_timing_hook_to_model(model, event_callback=None):
     model._timing_event_cb = event_callback
 
     handles = [
-        model.register_forward_pre_hook(_forward_pre_hook_model),
-        model.register_forward_hook(_forward_hook_model),
+        model.register_forward_pre_hook(_forward_pre_hook_model, with_kwargs=True),
+        model.register_forward_hook(_forward_hook_model, with_kwargs=True),
         model.vision_tower.register_forward_pre_hook(_forward_pre_hook_visual),
         model.vision_tower.register_forward_hook(_forward_hook_visual),
         model.language_model.register_forward_pre_hook(_forward_pre_hook_llm),
