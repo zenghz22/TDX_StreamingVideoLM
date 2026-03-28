@@ -1,9 +1,11 @@
 """LLaVA-OneVision 视频预处理与 KV cache 生成/保存。"""
 
 import time
+import json
 
 import torch
 from decord import VideoReader, cpu
+from safetensors.torch import save_file
 from transformers import LlavaOnevisionForConditionalGeneration as LlavaOV
 from transformers import LlavaOnevisionProcessor
 
@@ -63,8 +65,12 @@ def detach_kv_to_cpu(kv_cache):
 
 
 def save_kv_cache(kv_cache, kv_cache_path, model=None, extra_metadata=None):
-    """保存 KV cache 与元信息。"""
+    """保存 KV cache 与元信息（safetensors）。"""
     kv_cache_cpu = detach_kv_to_cpu(kv_cache)
+
+    if not isinstance(kv_cache_cpu, (tuple, list)):
+        raise TypeError("KV cache format is invalid: expected tuple/list of per-layer KV pairs.")
+
     metadata = {
         "saved_at": int(time.time()),
         "num_layers": len(kv_cache_cpu) if hasattr(kv_cache_cpu, "__len__") else None,
@@ -85,8 +91,21 @@ def save_kv_cache(kv_cache, kv_cache_path, model=None, extra_metadata=None):
     if extra_metadata:
         metadata.update(extra_metadata)
 
-    payload = {"kv_cache": kv_cache_cpu, "metadata": metadata}
-    torch.save(payload, kv_cache_path)
+    tensors = {}
+    for layer_idx, layer_kv in enumerate(kv_cache_cpu):
+        if not isinstance(layer_kv, (tuple, list)) or len(layer_kv) != 2:
+            raise TypeError(f"Layer {layer_idx} KV format is invalid: expected (key, value).")
+
+        layer_k, layer_v = layer_kv
+        if not isinstance(layer_k, torch.Tensor) or not isinstance(layer_v, torch.Tensor):
+            raise TypeError(f"Layer {layer_idx} KV should be torch.Tensor.")
+
+        tensors[f"layer_{layer_idx}.k"] = layer_k.contiguous()
+        tensors[f"layer_{layer_idx}.v"] = layer_v.contiguous()
+
+    # safetensors metadata 仅支持 str->str
+    metadata_str = {k: json.dumps(v, ensure_ascii=False) for k, v in metadata.items()}
+    save_file(tensors, kv_cache_path, metadata=metadata_str)
     print(f"KV cache saved to {kv_cache_path}.")
     print(f"KV metadata: {metadata}")
 
