@@ -23,17 +23,17 @@ if __name__ == "__main__":
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
     model_path = "llava-hf/llava-onevision-qwen2-7b-ov-hf"
-    video_path = "/home/zenghanzhang/tdx-streamvideo/data/muffin.mp4"
+    video_path = "../data/muffin.mp4"
     kv_cache_path = "../data/kv_cache_chunks"
     question = "What is the chef doing?"  # 示例问题
-    with measure_resources("Encode Video", logger=logger, plot_file = "device.png") as monitor:
+    with measure_resources("Encode Video", logger=logger, plot_file = "../data/device.png") as monitor:
         # 加载模型
         monitor["mark"]("load_model_encode")
         processor, model = load_model(model_path, load_weights=True)
         inject_timing_hook_to_model(model, event_callback=monitor["mark"])
 
         # 加载视频
-        video = load_video(video_path, sample_fps=4)
+        video = load_video(video_path, sample_fps=8)
 
         # kvcache编码与保存
         kv_cache = encode_video(
