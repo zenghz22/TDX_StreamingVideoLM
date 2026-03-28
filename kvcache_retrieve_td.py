@@ -1,8 +1,11 @@
 """LLaVA-OneVision KV cache 加载与解码。"""
 
+import json
+import os
 import pickle
 
 import torch
+from safetensors import safe_open
 
 
 def move_to_device(obj, device):
@@ -15,25 +18,134 @@ def move_to_device(obj, device):
     return obj
 
 
-def load_kv_cache(kv_cache_path, map_location="cpu"):
-    """从磁盘加载 KV cache 与元信息。"""
-    try:
-        payload = torch.load(kv_cache_path, map_location=map_location, weights_only=True)
-    except TypeError:
-        payload = torch.load(kv_cache_path, map_location=map_location)
-    except pickle.UnpicklingError as exc:
-        print("Warning: weights_only=True load failed, fallback to weights_only=False for trusted local cache.")
-        print(f"Details: {exc}")
-        payload = torch.load(kv_cache_path, map_location=map_location, weights_only=False)
+def _resolve_chunk_files_from_dir(kv_cache_dir, chunk_index=None):
+    manifest_path = os.path.join(kv_cache_dir, "manifest.json")
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(f"manifest.json not found in KV cache dir: {kv_cache_dir}")
 
-    if isinstance(payload, dict) and "kv_cache" in payload:
-        kv_cache = payload["kv_cache"]
-        metadata = payload.get("metadata", {})
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    chunks = manifest.get("chunks", [])
+    if not chunks:
+        raise ValueError(f"No chunk records found in manifest: {manifest_path}")
+
+    chunks_sorted = sorted(chunks, key=lambda x: int(x["chunk_index"]))
+
+    if chunk_index is None:
+        selected = chunks_sorted[-1]
+        selected_chunk_index = int(selected["chunk_index"])
     else:
-        kv_cache = payload
-        metadata = {}
+        selected_chunk_index = int(chunk_index)
+        idx_map = {int(c["chunk_index"]): c for c in chunks_sorted}
+        if selected_chunk_index not in idx_map:
+            raise ValueError(f"chunk_index={selected_chunk_index} not found in {manifest_path}")
+        selected = idx_map[selected_chunk_index]
 
-    print(f"Loaded KV cache from {kv_cache_path}")
+    selected_chunks = [c for c in chunks_sorted if int(c["chunk_index"]) <= selected_chunk_index]
+    if not selected_chunks:
+        raise ValueError(f"No chunks available before chunk_index={selected_chunk_index} in {manifest_path}")
+
+    resolved_files = []
+    for c in selected_chunks:
+        chunk_file = c.get("file")
+        if not chunk_file:
+            raise ValueError(f"Invalid chunk entry in manifest: {c}")
+        resolved_files.append(os.path.join(kv_cache_dir, chunk_file))
+
+    return resolved_files, manifest, selected, selected_chunks
+
+
+def _load_single_safetensors_kv(kv_cache_path, map_location="cpu"):
+    kv_layers = {}
+    metadata = {}
+    with safe_open(kv_cache_path, framework="pt", device=map_location) as f:
+        raw_metadata = f.metadata() or {}
+        for k, v in raw_metadata.items():
+            try:
+                metadata[k] = json.loads(v)
+            except (TypeError, json.JSONDecodeError):
+                metadata[k] = v
+
+        for key in f.keys():
+            if key.startswith("layer_") and (key.endswith(".k") or key.endswith(".v")):
+                layer_str, kv_suffix = key.split(".")
+                layer_idx = int(layer_str.split("_")[1])
+                kv_layers.setdefault(layer_idx, {})[kv_suffix] = f.get_tensor(key)
+
+    kv_cache = []
+    for layer_idx in sorted(kv_layers.keys()):
+        layer = kv_layers[layer_idx]
+        if "k" not in layer or "v" not in layer:
+            raise ValueError(f"Incomplete KV for layer {layer_idx} in {kv_cache_path}")
+        kv_cache.append((layer["k"], layer["v"]))
+    return tuple(kv_cache), metadata
+
+
+def _concat_kv_segments(kv_segments):
+    if not kv_segments:
+        return tuple()
+    n_layers = len(kv_segments[0])
+    full_kv = []
+    for layer_idx in range(n_layers):
+        k_parts = [seg[layer_idx][0] for seg in kv_segments]
+        v_parts = [seg[layer_idx][1] for seg in kv_segments]
+        full_kv.append((torch.cat(k_parts, dim=-2), torch.cat(v_parts, dim=-2)))
+    return tuple(full_kv)
+
+
+def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None):
+    """从磁盘加载 KV cache 与元信息（优先 safetensors）。"""
+    manifest = None
+    selected_chunk = None
+    resolved_path = kv_cache_path
+    selected_chunks = None
+    if os.path.isdir(kv_cache_path):
+        resolved_files, manifest, selected_chunk, selected_chunks = _resolve_chunk_files_from_dir(
+            kv_cache_path, chunk_index=chunk_index
+        )
+        kv_segments = []
+        metadata = {}
+        for shard_path in resolved_files:
+            shard_kv, shard_metadata = _load_single_safetensors_kv(shard_path, map_location=map_location)
+            kv_segments.append(shard_kv)
+            metadata = shard_metadata
+        kv_cache = _concat_kv_segments(kv_segments)
+        full_seq_len = int(kv_cache[0][0].shape[-2]) if kv_cache else 0
+        if "past_seq_len" in metadata:
+            metadata["past_seq_len_shard"] = metadata["past_seq_len"]
+        metadata["past_seq_len"] = full_seq_len
+        metadata["chunk_manifest"] = manifest
+        metadata["selected_chunk"] = selected_chunk
+        metadata["loaded_chunks"] = selected_chunks
+        metadata["loaded_from_dir"] = kv_cache_path
+        resolved_path = f"{kv_cache_path} (chunks 0..{selected_chunk['chunk_index']})"
+        print(f"Loaded KV cache from {resolved_path}")
+        if metadata:
+            print(f"KV metadata: {metadata}")
+        return kv_cache, metadata
+
+    if resolved_path.endswith(".safetensors"):
+        kv_cache, metadata = _load_single_safetensors_kv(resolved_path, map_location=map_location)
+    else:
+        # 兼容旧版 pt 存档（便于平滑迁移）
+        try:
+            payload = torch.load(resolved_path, map_location=map_location, weights_only=True)
+        except TypeError:
+            payload = torch.load(resolved_path, map_location=map_location)
+        except pickle.UnpicklingError as exc:
+            print("Warning: weights_only=True load failed, fallback to weights_only=False for trusted local cache.")
+            print(f"Details: {exc}")
+            payload = torch.load(resolved_path, map_location=map_location, weights_only=False)
+
+        if isinstance(payload, dict) and "kv_cache" in payload:
+            kv_cache = payload["kv_cache"]
+            metadata = payload.get("metadata", {})
+        else:
+            kv_cache = payload
+            metadata = {}
+
+    print(f"Loaded KV cache from {resolved_path}")
     if metadata:
         print(f"KV metadata: {metadata}")
     return kv_cache, metadata
@@ -45,12 +157,24 @@ def _build_decode_suffix(question):
 
 
 def _get_past_seq_len(kv_cache, metadata):
-    if metadata.get("past_seq_len") is not None:
-        return int(metadata["past_seq_len"])
+    actual_seq_len = 0
     try:
-        return int(kv_cache[0][0].shape[-2])
+        actual_seq_len = int(kv_cache[0][0].shape[-2])
     except Exception:
-        return 0
+        actual_seq_len = 0
+
+    meta_seq_len = metadata.get("past_seq_len")
+    if meta_seq_len is not None:
+        meta_seq_len = int(meta_seq_len)
+        # 若 metadata 与实际 KV 长度不一致（例如分片 metadata 是 delta 长度），以实际长度为准。
+        if actual_seq_len > 0 and meta_seq_len != actual_seq_len:
+            print(
+                f"Warning: metadata past_seq_len={meta_seq_len} mismatches actual KV len={actual_seq_len}, "
+                "using actual KV len."
+            )
+            return actual_seq_len
+        return meta_seq_len
+    return actual_seq_len
 
 
 def decode_kvcache(
@@ -58,6 +182,7 @@ def decode_kvcache(
     question,
     processor,
     model,
+    chunk_index=None,
     max_new_tokens=128,
     min_new_tokens=8,
     temperature=0.7,
@@ -65,7 +190,7 @@ def decode_kvcache(
     repetition_penalty=1.1,
 ):
     """加载 KV cache，直接文本解码，跳过视频预处理与编码。"""
-    kv_cache, metadata = load_kv_cache(kv_cache_path, map_location="cpu")
+    kv_cache, metadata = load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=chunk_index)
     if not kv_cache:
         raise ValueError("KV cache is empty.")
 
