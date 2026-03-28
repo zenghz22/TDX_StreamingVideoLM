@@ -33,7 +33,7 @@ if __name__ == "__main__":
         inject_timing_hook_to_model(model, event_callback=monitor["mark"])
 
         # 加载视频
-        video = load_video(video_path, sample_fps=8)
+        video = load_video(video_path, sample_fps=5)
 
         # kvcache编码与保存
         kv_cache = encode_video(
