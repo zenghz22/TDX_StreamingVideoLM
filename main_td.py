@@ -23,7 +23,7 @@ if __name__ == "__main__":
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
     model_path = "llava-hf/llava-onevision-qwen2-7b-ov-hf"
-    video_path = "/home/zenghanzhang/tdx-streamvideo/data/muffin.mp4"
+    video_path = "../data/muffin.mp4"
     kv_cache_path = "../data/kv_cache_chunks"
     question = "What is the chef doing?"  # 示例问题
     with measure_resources("Encode Video", logger=logger, plot_file = "../data/device.png") as monitor:
