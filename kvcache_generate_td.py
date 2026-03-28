@@ -3,8 +3,6 @@
 import time
 import json
 import os
-
-
 import torch
 from decord import VideoReader, cpu
 from safetensors.torch import save_file
@@ -214,7 +212,13 @@ def encode_video(
                 shard_file = f"chunk_{i:05d}.safetensors"
                 shard_path = os.path.join(kv_cache_dir, shard_file)
                 shard_metadata = save_kv_cache(
-                    kv_cache,
+                    tuple(
+                        (
+                            layer_kv[0][:, :, past_seq_len:, :].contiguous(),
+                            layer_kv[1][:, :, past_seq_len:, :].contiguous(),
+                        )
+                        for layer_kv in kv_cache
+                    ),
                     shard_path,
                     model=model,
                     extra_metadata={
@@ -222,6 +226,9 @@ def encode_video(
                         "chunk_index": i,
                         "chunk_size": chunk_size,
                         "num_frames": int(num_frames),
+                        "is_delta_chunk": True,
+                        "seq_start": int(past_seq_len),
+                        "seq_end": int(_get_cache_seq_len(kv_cache)),
                     },
                 )
                 if not common_metadata:
@@ -235,6 +242,9 @@ def encode_video(
                     {
                         "chunk_index": i,
                         "file": shard_file,
+                        "delta_seq_len": int(shard_metadata.get("past_seq_len") or 0),
+                        "seq_start": int(past_seq_len),
+                        "seq_end": int(_get_cache_seq_len(kv_cache)),
                         "past_seq_len": shard_metadata.get("past_seq_len"),
                         "layer0_key_shape": shard_metadata.get("layer0_key_shape"),
                     }

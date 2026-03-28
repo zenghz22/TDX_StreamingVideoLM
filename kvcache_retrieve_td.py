@@ -18,7 +18,7 @@ def move_to_device(obj, device):
     return obj
 
 
-def _resolve_chunk_file_from_dir(kv_cache_dir, chunk_index=None):
+def _resolve_chunk_files_from_dir(kv_cache_dir, chunk_index=None):
     manifest_path = os.path.join(kv_cache_dir, "manifest.json")
     if not os.path.exists(manifest_path):
         raise FileNotFoundError(f"manifest.json not found in KV cache dir: {kv_cache_dir}")
@@ -30,18 +30,68 @@ def _resolve_chunk_file_from_dir(kv_cache_dir, chunk_index=None):
     if not chunks:
         raise ValueError(f"No chunk records found in manifest: {manifest_path}")
 
-    if chunk_index is None:
-        selected = chunks[-1]
-    else:
-        idx_map = {int(c["chunk_index"]): c for c in chunks}
-        if chunk_index not in idx_map:
-            raise ValueError(f"chunk_index={chunk_index} not found in {manifest_path}")
-        selected = idx_map[chunk_index]
+    chunks_sorted = sorted(chunks, key=lambda x: int(x["chunk_index"]))
 
-    chunk_file = selected.get("file")
-    if not chunk_file:
-        raise ValueError(f"Invalid chunk entry in manifest: {selected}")
-    return os.path.join(kv_cache_dir, chunk_file), manifest, selected
+    if chunk_index is None:
+        selected = chunks_sorted[-1]
+        selected_chunk_index = int(selected["chunk_index"])
+    else:
+        selected_chunk_index = int(chunk_index)
+        idx_map = {int(c["chunk_index"]): c for c in chunks_sorted}
+        if selected_chunk_index not in idx_map:
+            raise ValueError(f"chunk_index={selected_chunk_index} not found in {manifest_path}")
+        selected = idx_map[selected_chunk_index]
+
+    selected_chunks = [c for c in chunks_sorted if int(c["chunk_index"]) <= selected_chunk_index]
+    if not selected_chunks:
+        raise ValueError(f"No chunks available before chunk_index={selected_chunk_index} in {manifest_path}")
+
+    resolved_files = []
+    for c in selected_chunks:
+        chunk_file = c.get("file")
+        if not chunk_file:
+            raise ValueError(f"Invalid chunk entry in manifest: {c}")
+        resolved_files.append(os.path.join(kv_cache_dir, chunk_file))
+
+    return resolved_files, manifest, selected, selected_chunks
+
+
+def _load_single_safetensors_kv(kv_cache_path, map_location="cpu"):
+    kv_layers = {}
+    metadata = {}
+    with safe_open(kv_cache_path, framework="pt", device=map_location) as f:
+        raw_metadata = f.metadata() or {}
+        for k, v in raw_metadata.items():
+            try:
+                metadata[k] = json.loads(v)
+            except (TypeError, json.JSONDecodeError):
+                metadata[k] = v
+
+        for key in f.keys():
+            if key.startswith("layer_") and (key.endswith(".k") or key.endswith(".v")):
+                layer_str, kv_suffix = key.split(".")
+                layer_idx = int(layer_str.split("_")[1])
+                kv_layers.setdefault(layer_idx, {})[kv_suffix] = f.get_tensor(key)
+
+    kv_cache = []
+    for layer_idx in sorted(kv_layers.keys()):
+        layer = kv_layers[layer_idx]
+        if "k" not in layer or "v" not in layer:
+            raise ValueError(f"Incomplete KV for layer {layer_idx} in {kv_cache_path}")
+        kv_cache.append((layer["k"], layer["v"]))
+    return tuple(kv_cache), metadata
+
+
+def _concat_kv_segments(kv_segments):
+    if not kv_segments:
+        return tuple()
+    n_layers = len(kv_segments[0])
+    full_kv = []
+    for layer_idx in range(n_layers):
+        k_parts = [seg[layer_idx][0] for seg in kv_segments]
+        v_parts = [seg[layer_idx][1] for seg in kv_segments]
+        full_kv.append((torch.cat(k_parts, dim=-2), torch.cat(v_parts, dim=-2)))
+    return tuple(full_kv)
 
 
 def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None):
@@ -49,36 +99,30 @@ def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None):
     manifest = None
     selected_chunk = None
     resolved_path = kv_cache_path
+    selected_chunks = None
     if os.path.isdir(kv_cache_path):
-        resolved_path, manifest, selected_chunk = _resolve_chunk_file_from_dir(kv_cache_path, chunk_index=chunk_index)
+        resolved_files, manifest, selected_chunk, selected_chunks = _resolve_chunk_files_from_dir(
+            kv_cache_path, chunk_index=chunk_index
+        )
+        kv_segments = []
+        metadata = {}
+        for shard_path in resolved_files:
+            shard_kv, shard_metadata = _load_single_safetensors_kv(shard_path, map_location=map_location)
+            kv_segments.append(shard_kv)
+            metadata = shard_metadata
+        kv_cache = _concat_kv_segments(kv_segments)
+        metadata["chunk_manifest"] = manifest
+        metadata["selected_chunk"] = selected_chunk
+        metadata["loaded_chunks"] = selected_chunks
+        metadata["loaded_from_dir"] = kv_cache_path
+        resolved_path = f"{kv_cache_path} (chunks 0..{selected_chunk['chunk_index']})"
+        print(f"Loaded KV cache from {resolved_path}")
+        if metadata:
+            print(f"KV metadata: {metadata}")
+        return kv_cache, metadata
 
     if resolved_path.endswith(".safetensors"):
-        kv_layers = {}
-        metadata = {}
-        with safe_open(resolved_path, framework="pt", device=map_location) as f:
-            raw_metadata = f.metadata() or {}
-            for k, v in raw_metadata.items():
-                try:
-                    metadata[k] = json.loads(v)
-                except (TypeError, json.JSONDecodeError):
-                    metadata[k] = v
-
-            for key in f.keys():
-                if key.startswith("layer_") and (key.endswith(".k") or key.endswith(".v")):
-                    layer_str, kv_suffix = key.split(".")
-                    layer_idx = int(layer_str.split("_")[1])
-                    kv_layers.setdefault(layer_idx, {})[kv_suffix] = f.get_tensor(key)
-
-        kv_cache = []
-        for layer_idx in sorted(kv_layers.keys()):
-            layer = kv_layers[layer_idx]
-            if "k" not in layer or "v" not in layer:
-                raise ValueError(f"Incomplete KV for layer {layer_idx} in {resolved_path}")
-            kv_cache.append((layer["k"], layer["v"]))
-        kv_cache = tuple(kv_cache)
-        if manifest is not None:
-            metadata["chunk_manifest"] = manifest
-            metadata["selected_chunk"] = selected_chunk
+        kv_cache, metadata = _load_single_safetensors_kv(resolved_path, map_location=map_location)
     else:
         # 兼容旧版 pt 存档（便于平滑迁移）
         try:
