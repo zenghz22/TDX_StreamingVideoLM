@@ -111,6 +111,10 @@ def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None):
             kv_segments.append(shard_kv)
             metadata = shard_metadata
         kv_cache = _concat_kv_segments(kv_segments)
+        full_seq_len = int(kv_cache[0][0].shape[-2]) if kv_cache else 0
+        if "past_seq_len" in metadata:
+            metadata["past_seq_len_shard"] = metadata["past_seq_len"]
+        metadata["past_seq_len"] = full_seq_len
         metadata["chunk_manifest"] = manifest
         metadata["selected_chunk"] = selected_chunk
         metadata["loaded_chunks"] = selected_chunks
@@ -153,12 +157,24 @@ def _build_decode_suffix(question):
 
 
 def _get_past_seq_len(kv_cache, metadata):
-    if metadata.get("past_seq_len") is not None:
-        return int(metadata["past_seq_len"])
+    actual_seq_len = 0
     try:
-        return int(kv_cache[0][0].shape[-2])
+        actual_seq_len = int(kv_cache[0][0].shape[-2])
     except Exception:
-        return 0
+        actual_seq_len = 0
+
+    meta_seq_len = metadata.get("past_seq_len")
+    if meta_seq_len is not None:
+        meta_seq_len = int(meta_seq_len)
+        # 若 metadata 与实际 KV 长度不一致（例如分片 metadata 是 delta 长度），以实际长度为准。
+        if actual_seq_len > 0 and meta_seq_len != actual_seq_len:
+            print(
+                f"Warning: metadata past_seq_len={meta_seq_len} mismatches actual KV len={actual_seq_len}, "
+                "using actual KV len."
+            )
+            return actual_seq_len
+        return meta_seq_len
+    return actual_seq_len
 
 
 def decode_kvcache(
