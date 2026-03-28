@@ -2,6 +2,8 @@
 
 import time
 import json
+import os
+
 
 import torch
 from decord import VideoReader, cpu
@@ -108,13 +110,40 @@ def save_kv_cache(kv_cache, kv_cache_path, model=None, extra_metadata=None):
     save_file(tensors, kv_cache_path, metadata=metadata_str)
     print(f"KV cache saved to {kv_cache_path}.")
     print(f"KV metadata: {metadata}")
+    return metadata
 
 
-def encode_video(video, processor, model=None, chunk_size=64, encode_prefix=ENCODE_PREFIX, stage_mark=None):
+def _write_chunk_manifest(kv_cache_dir, chunks, common_metadata):
+    manifest = {
+        "format": "kvcache_safetensors_chunks_v1",
+        "num_chunks": len(chunks),
+        "chunks": chunks,
+        "common_metadata": common_metadata or {},
+    }
+    manifest_path = os.path.join(kv_cache_dir, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    print(f"KV chunk manifest saved to {manifest_path}")
+
+
+def encode_video(
+    video,
+    processor,
+    model=None,
+    chunk_size=64,
+    encode_prefix=ENCODE_PREFIX,
+    stage_mark=None,
+    kv_cache_dir=None,
+):
     """将视频分块编码成 KV cache。"""
     kv_cache = []
     num_frames = video.shape[0]
     num_chunks = (num_frames + chunk_size - 1) // chunk_size
+    chunk_records = []
+    common_metadata = {}
+
+    if kv_cache_dir is not None:
+        os.makedirs(kv_cache_dir, exist_ok=True)
 
     for i in range(num_chunks):
         chunk = video[i * chunk_size : min((i + 1) * chunk_size, num_frames)]
@@ -180,8 +209,41 @@ def encode_video(video, processor, model=None, chunk_size=64, encode_prefix=ENCO
             first_layer_v = kv_cache[0][1]
             print(f"[chunk {i}] kv_cache layer0 key shape: {tuple(first_layer_k.shape)}")
             print(f"[chunk {i}] kv_cache layer0 value shape: {tuple(first_layer_v.shape)}")
+
+            if kv_cache_dir is not None:
+                shard_file = f"chunk_{i:05d}.safetensors"
+                shard_path = os.path.join(kv_cache_dir, shard_file)
+                shard_metadata = save_kv_cache(
+                    kv_cache,
+                    shard_path,
+                    model=model,
+                    extra_metadata={
+                        "encode_prefix": encode_prefix,
+                        "chunk_index": i,
+                        "chunk_size": chunk_size,
+                        "num_frames": int(num_frames),
+                    },
+                )
+                if not common_metadata:
+                    common_metadata = {
+                        "encode_prefix": encode_prefix,
+                        "chunk_size": chunk_size,
+                        "num_frames": int(num_frames),
+                        "model_name_or_path": shard_metadata.get("model_name_or_path"),
+                    }
+                chunk_records.append(
+                    {
+                        "chunk_index": i,
+                        "file": shard_file,
+                        "past_seq_len": shard_metadata.get("past_seq_len"),
+                        "layer0_key_shape": shard_metadata.get("layer0_key_shape"),
+                    }
+                )
    
         #if stage_mark is not None:
         #    stage_mark(f"chunk_{i}_end")
+
+    if kv_cache_dir is not None:
+        _write_chunk_manifest(kv_cache_dir, chunk_records, common_metadata)
 
     return kv_cache

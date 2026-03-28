@@ -2,7 +2,7 @@ import os
 import gc
 import time
 
-from kvcache_generate_td import ENCODE_PREFIX, encode_video, load_model, load_video, save_kv_cache
+from kvcache_generate_td import ENCODE_PREFIX, encode_video, load_model, load_video
 from kvcache_retrieve_td import decode_kvcache
 from zhz_hardware_eval_utils import *
 from zhz_model_eval_utils import *
@@ -23,10 +23,8 @@ if __name__ == "__main__":
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
     model_path = "llava-hf/llava-onevision-qwen2-7b-ov-hf"
-
-    video_path = "../data/muffin.mp4"
-    kv_cache_path = "../data/kv_cache.safetensors"
-
+    video_path = "/home/zenghanzhang/tdx-streamvideo/data/muffin.mp4"
+    kv_cache_path = "../data/kv_cache_chunks"
     question = "What is the chef doing?"  # 示例问题
     with measure_resources("Encode Video", logger=logger, plot_file = "../data/device.png") as monitor:
         # 加载模型
@@ -38,9 +36,16 @@ if __name__ == "__main__":
         video = load_video(video_path, sample_fps=8)
 
         # kvcache编码与保存
-        kv_cache = encode_video(video, processor, model=model, chunk_size=10, encode_prefix=ENCODE_PREFIX, stage_mark=monitor["mark"])
+        kv_cache = encode_video(
+            video,
+            processor,
+            model=model,
+            chunk_size=16,
+            encode_prefix=ENCODE_PREFIX,
+            stage_mark=monitor["mark"],
+            kv_cache_dir=kv_cache_path,
+        )
 
-        save_kv_cache(kv_cache, kv_cache_path, model=model, extra_metadata={"encode_prefix": ENCODE_PREFIX})
         del kv_cache
         #print_timing_stats(model)
         # 卸载模型
