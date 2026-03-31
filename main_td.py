@@ -19,6 +19,11 @@ from zhz_model_eval_utils import *
 #   W > 0 → 局部 attention（精度略降，内存严格有界）
 #   推荐：max_in_memory = window_size + 1，给 delta 留一个空位。
 
+# decode 阶段：指定只加载哪些 chunk 的 KV
+# None  → 加载全部 chunk（原有行为）
+# [...] → 只加载指定 chunk，峰值内存随列表长度线性降低
+# 示例：DECODE_CHUNK_INDICES = [10, 11, 12, 13, 14]  # 只看视频后半段
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,11 +48,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TD-side video encoding and decoding")
     parser.add_argument("--max_in_memory", type=int, default=10)
     parser.add_argument("--window_size", type=int, default=0)
-    parser.add_argument("--plot_file", type=str, default=None)    
+    parser.add_argument("--plot_file", type=str, default=None)
+    parser.add_argument("--decode_indices", type=str, default=None)      
     args = parser.parse_args()
 
     with measure_resources("Encode Video", logger=logger, plot_file=args.plot_file) as monitor:
-
+        '''
         # ── 编码阶段 ──────────────────────────────────────────────────────
         monitor["mark"]("load_model_encode")
         processor, model = load_model(model_path, load_weights=True)
@@ -77,17 +83,31 @@ if __name__ == "__main__":
         del model, manager
         gc.collect()
         time.sleep(10)
+        '''
+        # ── 解码阶段──────────────────────────────────────────────
+        monitor["mark"]("load_model_decode")
+        processor, model = load_model(model_path, load_weights=True)
+        inject_timing_hook_to_model(model)
 
-    # ── 解码阶段（不变）──────────────────────────────────────────────
-    monitor["mark"]("load_model_decode")
-    processor, model = load_model(model_path, load_weights=True)
-    inject_timing_hook_to_model(model)
+        monitor["mark"]("kvcache_decode")
+        DECODE_CHUNK_INDICES = (
+            [int(x) for x in args.decode_indices.split(",")]
+            if args.decode_indices is not None and args.decode_indices != ""
+            else None
+        )
+        answer = decode_kvcache(
+            kv_cache_path, 
+            question, 
+            processor, 
+            model,
+            max_new_tokens=32,
+            min_new_tokens=32,
+            temperature=0.0,
+            chunk_indices=DECODE_CHUNK_INDICES,
+            )
 
-    monitor["mark"]("kvcache_decode")
-    answer = decode_kvcache(kv_cache_path, question, processor, model)
+        print("Answer:", answer)
 
-    print("Answer:", answer)
-
-    remove_timing_hooks_from_model()
-    del model
-    gc.collect()
+        remove_timing_hooks_from_model()
+        del model
+        gc.collect()
