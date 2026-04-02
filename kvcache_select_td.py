@@ -18,14 +18,14 @@ kvcache_select_td.py — Prompt-aware KV Cache chunk 选择器
   "summary_vec"——该 chunk 所有 delta K 向量的跨层跨 token 均值。
 
   select 阶段：
-  1. 对 question tokens 做一次轻量 forward（use_cache=False，只拿 K 向量）
+  1. 对 question tokens 做一次轻量 forward（use_cache=False，只拿 Q 向量）
   2. 同样计算跨层跨 token 均值，得到 query_vec
   3. 对每个 chunk 的 summary_vec 计算 cosine similarity
   4. 返回 top_k 个 chunk_index（按升序保留原始时序）
 
-为什么用模型内部 K 向量而不是 CLIP embedding？
-  K 向量与模型的注意力空间对齐——query 在 decode 时正是用这些 K 向量
-  做 attention，因此 K-space cosine similarity 直接度量"这个 chunk 对
+为什么用模型内部 Q/K 向量而不是 CLIP embedding？
+  Q/K 向量与模型的注意力空间对齐——query 在 decode 时正是用这些 K 向量
+  做 attention，因此 QK-space cosine similarity 直接度量"这个 chunk 对
   这个 question 有多大注意力贡献"，比跨模型的 CLIP 空间更准确。
 """
 
@@ -35,6 +35,7 @@ from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
+from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
 
 
 # ---------------------------------------------------------------------------
@@ -77,28 +78,53 @@ def _load_summary_vecs(kv_cache_dir: str):
 
 
 # ---------------------------------------------------------------------------
-# 计算 question 的 query_vec（K 向量，带视频末尾位置上下文）
+# 计算 question 的 query_vec（Q 向量，带视频末尾位置上下文）
 # ---------------------------------------------------------------------------
+
+def _group_query_to_kv_heads(query_states: torch.Tensor, num_kv_heads: int) -> torch.Tensor:
+    """
+    将 query heads 聚合到 kv heads 维度，便于与 chunk K summary 对齐。
+
+    query_states: [batch, num_heads, seq, head_dim]
+    return      : [num_kv_heads, head_dim] （对 batch/seq 求均值）
+    """
+    # [batch, num_heads, seq, head_dim]
+    _, num_heads, _, head_dim = query_states.shape
+    if num_heads == num_kv_heads:
+        grouped = query_states
+    else:
+        if num_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"num_heads ({num_heads}) is not divisible by num_kv_heads ({num_kv_heads})."
+            )
+        group_size = num_heads // num_kv_heads
+        # [batch, num_kv_heads, group_size, seq, head_dim] -> mean(group_size)
+        grouped = query_states.view(
+            query_states.shape[0], num_kv_heads, group_size, query_states.shape[2], head_dim
+        ).mean(dim=2)
+
+    return grouped.mean(dim=0).mean(dim=1).float()  # [num_kv_heads, head_dim]
+
 
 def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> torch.Tensor:
     """
     以最后一个 chunk 的 KV 作为 past_key_values，对 question 做 forward，
-    提取各层新增的 K 向量（即 question tokens 的 K），跨层跨 token 均值后返回。
+    提取各层新增的 Q 向量（即 question tokens 的 Q），跨层跨 token 均值后返回。
 
     为什么必须带 past context：
-      Qwen2 使用 RoPE，K 向量的值依赖 token 的绝对位置。
+      Qwen2 使用 RoPE，Q/K 向量都依赖 token 的绝对位置。
       encode 时 video chunk i 的 K 向量处于位置 pos≈i*chunk_merged_len。
-      若 question standalone forward（past=None），其 K 向量从 pos=0 开始，
+      若 question standalone forward（past=None），其 Q 向量从 pos=0 开始，
       与 video K 向量的位置差距极大，cosine similarity 由位置主导而非内容，
       导致无论问什么问题相似度都单调递减。
 
       以最后一个 chunk 的 KV 作为 past context forward question，
       question tokens 的位置 ID 从 video 末尾（pos≈N）开始，
       与各 video chunk 的位置差距变为有意义的时序距离，
-      cosine(K_question, K_chunk_i) 才能反映问题与各段视频的语义相关性。
+      cosine(Q_question, K_chunk_i) 才能反映问题与各段视频的语义相关性。
       这与 ReKV 论文的内部检索方式一致。
     """
-    from kvcache_retrieve_td import _load_single_safetensors_kv, _concat_kv_segments, move_to_device
+    from kvcache_retrieve_td import _load_single_safetensors_kv, move_to_device
 
     # 加载最后一个 chunk 的 KV 作为 past context
     manifest_path = os.path.join(kv_cache_dir, "manifest.json")
@@ -125,20 +151,61 @@ def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> to
         device=device,
     )
 
+    # ---------------- ReKV Internal-style: 用 question 的 Q 向量做检索 ----------------
+    # 1) 先做一次 forward，拿到每层 hidden_states（layer 输入）
+    # 2) 对每层 hidden_states 通过 self_attn.q_proj 得到 Q
+    # 3) 用与解码一致的 position_ids 做 RoPE（关键）
+    # 4) 将 Q heads 聚合到 KV heads 维度，再跨层平均
+    position_ids = torch.arange(
+        past_seq_len, past_seq_len + current_len, device=device, dtype=torch.long
+    ).unsqueeze(0)
+
     with torch.no_grad():
-        outputs = model(**inputs, past_key_values=last_kv, use_cache=True, return_dict=True)
+        outputs = model(
+            **inputs,
+            past_key_values=last_kv,
+            use_cache=False,
+            output_hidden_states=True,
+            return_dict=True,
+            position_ids=position_ids,
+        )
 
-    # past_key_values 的 seq 维度 = past_seq_len + question_merged_len
-    # question 的 K 向量 = [past_seq_len:] 的部分
-    full_kv = outputs.past_key_values
-    k_means = []
-    for layer_k, _ in full_kv:
-        # layer_k: [batch, num_kv_heads, full_seq, head_dim]
-        q_k = layer_k[0, :, past_seq_len:, :].float()  # [num_kv_heads, question_seq, head_dim]
-        k_means.append(q_k.mean(dim=1))                 # [num_kv_heads, head_dim]
+    hidden_states = outputs.hidden_states
+    if hidden_states is None:
+        raise RuntimeError("Failed to get hidden_states for retrieval query vector computation.")
 
-    query_vec = torch.stack(k_means, dim=0).mean(dim=0).flatten().cpu()
-    del outputs, full_kv, last_kv
+    q_means = []
+    layers = model.language_model.model.layers
+    for layer_idx, layer in enumerate(layers):
+        layer_input = hidden_states[layer_idx]  # 第 layer_idx 层的输入
+        attn = layer.self_attn
+
+        # [B, Hq, T, D]
+        q_states = attn.q_proj(layer_input).view(
+            layer_input.shape[0], layer_input.shape[1], attn.num_heads, attn.head_dim
+        ).transpose(1, 2)
+
+        # 为了与 K-summary 对齐，按 KV 头数聚合 query 头
+        # RoPE 需要和解码时位置一致：position_ids 从 past_seq_len 开始
+        if hasattr(attn, "k_proj") and hasattr(attn, "rotary_emb"):
+            k_dummy = attn.k_proj(layer_input).view(
+                layer_input.shape[0], layer_input.shape[1], attn.num_key_value_heads, attn.head_dim
+            ).transpose(1, 2)
+
+            # Qwen2Attention.rotary_emb 在不同版本 transformers 参数签名略有差异：
+            # 这里优先按 (x, position_ids) 调用；失败则退回不带 position_ids。
+            try:
+                cos, sin = attn.rotary_emb(k_dummy, position_ids)
+            except TypeError:
+                cos, sin = attn.rotary_emb(k_dummy)
+
+            q_states, _ = apply_rotary_pos_emb(q_states, k_dummy, cos, sin)
+
+        q_grouped = _group_query_to_kv_heads(q_states, attn.num_key_value_heads)  # [Hkv, D]
+        q_means.append(q_grouped)
+
+    query_vec = torch.stack(q_means, dim=0).mean(dim=0).flatten().cpu()
+    del outputs, hidden_states, last_kv
     return query_vec.float()
 
 
@@ -184,7 +251,7 @@ def select_chunks(
         print(f"[select_chunks] top_k={top_k} >= total chunks={n_chunks}, returning all.")
         return all_indices
 
-    # 2. 计算 question 的 K 向量（以视频末尾为位置上下文）
+    # 2. 计算 question 的 Q 向量（以视频末尾为位置上下文）
     query_vec = _compute_query_vec(question, processor, model, kv_cache_dir)
 
     # 3. Q_question · K_chunk —— 真实 attention score 的代理

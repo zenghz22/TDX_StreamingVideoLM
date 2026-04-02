@@ -199,6 +199,7 @@ def decode_kvcache(
     temperature=0.7,
     top_p=0.9,
     repetition_penalty=1.1,
+    decode_strategy="sample",
 ):
     """加载 KV cache，直接文本解码，跳过视频预处理与编码。
 
@@ -206,6 +207,10 @@ def decode_kvcache(
         指定只加载哪些 chunk 的 KV（例如 [0, 3, 7]）。
         None 表示加载全部（原有行为）。
         加载的 chunk 越少，decode 阶段峰值内存越低。
+    decode_strategy : str
+        生成策略：
+          - "sample": 采样（temperature/top_p/repetition_penalty 生效）
+          - "greedy": 贪心（忽略 top_p，temperature/repetition_penalty 不生效）
     """
     kv_cache, metadata = load_kv_cache(
         kv_cache_path, map_location="cpu",
@@ -241,6 +246,9 @@ def decode_kvcache(
 
     print(f"decode past_seq_len: {past_seq_len}, current_seq_len: {current_seq_len}")
 
+    if decode_strategy not in {"sample", "greedy"}:
+        raise ValueError(f"Unsupported decode_strategy={decode_strategy}, expected one of ['sample', 'greedy'].")
+
     with torch.no_grad():
         outputs = model(
             **model_inputs,
@@ -254,9 +262,12 @@ def decode_kvcache(
         generated_token_ids = []
 
         logits = outputs.logits[:, -1, :]
-        logits = logits / max(temperature, 1e-5)
-        probs = torch.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
+        if decode_strategy == "greedy":
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+        else:
+            logits = logits / max(temperature, 1e-5)
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
         generated.append(next_token)
         generated_token_ids.append(int(next_token.item()))
 
@@ -276,26 +287,29 @@ def decode_kvcache(
             past = step_outputs.past_key_values
             logits = step_outputs.logits[:, -1, :]
 
-            # repetition penalty: 降低已生成 token 再次被选中的概率。
-            if repetition_penalty > 1.0:
-                for tid in set(generated_token_ids):
-                    logits[:, tid] = logits[:, tid] / repetition_penalty
+            if decode_strategy == "greedy":
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
+                # repetition penalty: 降低已生成 token 再次被选中的概率。
+                if repetition_penalty > 1.0:
+                    for tid in set(generated_token_ids):
+                        logits[:, tid] = logits[:, tid] / repetition_penalty
 
-            logits = logits / max(temperature, 1e-5)
+                logits = logits / max(temperature, 1e-5)
 
-            # nucleus sampling (top-p)
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                sorted_probs = torch.softmax(sorted_logits, dim=-1)
-                cum_probs = torch.cumsum(sorted_probs, dim=-1)
-                sorted_remove = cum_probs > top_p
-                sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
-                sorted_remove[..., 0] = False
-                sorted_logits[sorted_remove] = -1e10
-                logits = torch.full_like(logits, -1e10).scatter(1, sorted_indices, sorted_logits)
+                # nucleus sampling (top-p)
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                    cum_probs = torch.cumsum(sorted_probs, dim=-1)
+                    sorted_remove = cum_probs > top_p
+                    sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+                    sorted_remove[..., 0] = False
+                    sorted_logits[sorted_remove] = -1e10
+                    logits = torch.full_like(logits, -1e10).scatter(1, sorted_indices, sorted_logits)
 
-            probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+                probs = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
             generated.append(next_token)
             generated_token_ids.append(int(next_token.item()))
 
