@@ -18,7 +18,7 @@ def move_to_device(obj, device):
     return obj
 
 
-def _resolve_chunk_files_from_dir(kv_cache_dir, chunk_index=None):
+def _resolve_chunk_files_from_dir(kv_cache_dir, chunk_index=None, chunk_indices=None):
     manifest_path = os.path.join(kv_cache_dir, "manifest.json")
     if not os.path.exists(manifest_path):
         raise FileNotFoundError(f"manifest.json not found in KV cache dir: {kv_cache_dir}")
@@ -32,19 +32,28 @@ def _resolve_chunk_files_from_dir(kv_cache_dir, chunk_index=None):
 
     chunks_sorted = sorted(chunks, key=lambda x: int(x["chunk_index"]))
 
-    if chunk_index is None:
-        selected = chunks_sorted[-1]
-        selected_chunk_index = int(selected["chunk_index"])
-    else:
-        selected_chunk_index = int(chunk_index)
+    # 方案 B：用户指定任意 chunk 子集
+    if chunk_indices is not None:
         idx_map = {int(c["chunk_index"]): c for c in chunks_sorted}
-        if selected_chunk_index not in idx_map:
-            raise ValueError(f"chunk_index={selected_chunk_index} not found in {manifest_path}")
-        selected = idx_map[selected_chunk_index]
+        missing = [i for i in chunk_indices if i not in idx_map]
+        if missing:
+            raise ValueError(f"chunk_indices {missing} not found in manifest: {manifest_path}")
+        selected_chunks = sorted([idx_map[i] for i in chunk_indices], key=lambda c: int(c["chunk_index"]))
+        selected = selected_chunks[-1]
+    else:
+        if chunk_index is None:
+            selected = chunks_sorted[-1]
+            selected_chunk_index = int(selected["chunk_index"])
+        else:
+            selected_chunk_index = int(chunk_index)
+            idx_map = {int(c["chunk_index"]): c for c in chunks_sorted}
+            if selected_chunk_index not in idx_map:
+                raise ValueError(f"chunk_index={selected_chunk_index} not found in {manifest_path}")
+            selected = idx_map[selected_chunk_index]
 
-    selected_chunks = [c for c in chunks_sorted if int(c["chunk_index"]) <= selected_chunk_index]
-    if not selected_chunks:
-        raise ValueError(f"No chunks available before chunk_index={selected_chunk_index} in {manifest_path}")
+        selected_chunks = [c for c in chunks_sorted if int(c["chunk_index"]) <= selected_chunk_index]
+        if not selected_chunks:
+            raise ValueError(f"No chunks available before chunk_index={selected_chunk_index} in {manifest_path}")
 
     resolved_files = []
     for c in selected_chunks:
@@ -94,7 +103,7 @@ def _concat_kv_segments(kv_segments):
     return tuple(full_kv)
 
 
-def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None):
+def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_indices=None):
     """从磁盘加载 KV cache 与元信息（优先 safetensors）。"""
     manifest = None
     selected_chunk = None
@@ -102,7 +111,7 @@ def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None):
     selected_chunks = None
     if os.path.isdir(kv_cache_path):
         resolved_files, manifest, selected_chunk, selected_chunks = _resolve_chunk_files_from_dir(
-            kv_cache_path, chunk_index=chunk_index
+            kv_cache_path, chunk_index=chunk_index, chunk_indices=chunk_indices
         )
         kv_segments = []
         metadata = {}
@@ -119,7 +128,8 @@ def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None):
         metadata["selected_chunk"] = selected_chunk
         metadata["loaded_chunks"] = selected_chunks
         metadata["loaded_from_dir"] = kv_cache_path
-        resolved_path = f"{kv_cache_path} (chunks 0..{selected_chunk['chunk_index']})"
+        loaded_indices = [int(c["chunk_index"]) for c in selected_chunks]
+        resolved_path = f"{kv_cache_path} (chunks {loaded_indices})"
         print(f"Loaded KV cache from {resolved_path}")
         if metadata:
             print(f"KV metadata: {metadata}")
@@ -153,7 +163,7 @@ def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None):
 
 def _build_decode_suffix(question):
     # 与编码前缀配套的续写格式，避免 chat-template 与 KV 上下文不匹配。
-    return "\n问题：" + question + "\n回答："
+    return "\nQuestion: " + question + "\nAnswer: "
 
 
 def _get_past_seq_len(kv_cache, metadata):
@@ -183,14 +193,24 @@ def decode_kvcache(
     processor,
     model,
     chunk_index=None,
+    chunk_indices=None,
     max_new_tokens=128,
     min_new_tokens=8,
     temperature=0.7,
     top_p=0.9,
     repetition_penalty=1.1,
 ):
-    """加载 KV cache，直接文本解码，跳过视频预处理与编码。"""
-    kv_cache, metadata = load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=chunk_index)
+    """加载 KV cache，直接文本解码，跳过视频预处理与编码。
+
+    chunk_indices : list[int] | None
+        指定只加载哪些 chunk 的 KV（例如 [0, 3, 7]）。
+        None 表示加载全部（原有行为）。
+        加载的 chunk 越少，decode 阶段峰值内存越低。
+    """
+    kv_cache, metadata = load_kv_cache(
+        kv_cache_path, map_location="cpu",
+        chunk_index=chunk_index, chunk_indices=chunk_indices,
+    )
     if not kv_cache:
         raise ValueError("KV cache is empty.")
 
