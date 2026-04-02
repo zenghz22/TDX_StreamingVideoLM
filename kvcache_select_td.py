@@ -13,15 +13,12 @@ kvcache_select_td.py — Prompt-aware KV Cache chunk 选择器
 输出：
   - List[int]      : 选中的 chunk_index 列表（升序排列）
 
-原理（来自 ReKV ICLR'25 Eq.2）：
-  encode 阶段已在 manifest.json 的每个 chunk record 里保存了
-  "summary_vec"——该 chunk 所有 delta K 向量的跨层跨 token 均值。
-
-  select 阶段：
-  1. 对 question tokens 做一次轻量 forward（use_cache=False，只拿 Q 向量）
-  2. 同样计算跨层跨 token 均值，得到 query_vec
-  3. 对每个 chunk 的 summary_vec 计算 cosine similarity
-  4. 返回 top_k 个 chunk_index（按升序保留原始时序）
+原理（参考 ReKV ICLR'25 Internal Retrieval）：
+  select 阶段直接从每个 chunk shard 提取逐层 K 向量均值，并计算问题逐层 Q 向量：
+  1. 从 chunk_i.safetensors 读取每层 K，做 token 均值得到 K_i(layer)
+  2. 对 question 做一次轻量 forward（use_cache=False，取每层 Q）
+  3. 对 Q 按 KV 头维度聚合，并进行 RoPE 位置对齐
+  4. 逐层 cosine(Q_layer, K_layer) 后取层均值，返回 top_k 个 chunk
 
 为什么用模型内部 Q/K 向量而不是 CLIP embedding？
   Q/K 向量与模型的注意力空间对齐——query 在 decode 时正是用这些 K 向量
@@ -31,7 +28,7 @@ kvcache_select_td.py — Prompt-aware KV Cache chunk 选择器
 
 import json
 import os
-from typing import List, Optional
+from typing import List
 
 import torch
 import torch.nn.functional as F
@@ -39,17 +36,16 @@ from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
 
 
 # ---------------------------------------------------------------------------
-# 从 manifest 加载 summary_vec
+# 从 manifest 加载 chunk 元数据
 # ---------------------------------------------------------------------------
 
-def _load_summary_vecs(kv_cache_dir: str):
+def _load_manifest_chunks(kv_cache_dir: str):
     """
-    从 manifest.json 读取每个 chunk 的 summary_vec。
+    从 manifest.json 读取 chunk 记录。
 
     Returns
     -------
-    chunk_indices : List[int]     按 chunk_index 升序
-    summary_vecs  : torch.Tensor  shape = [num_chunks, vec_dim]，fp32
+    chunks : List[dict] 按 chunk_index 升序
     """
     manifest_path = os.path.join(kv_cache_dir, "manifest.json")
     if not os.path.exists(manifest_path):
@@ -62,19 +58,35 @@ def _load_summary_vecs(kv_cache_dir: str):
     if not chunks:
         raise ValueError("No chunk records in manifest.")
 
-    indices = []
-    vecs = []
-    for c in chunks:
-        sv = c.get("summary_vec")
-        if sv is None:
-            raise ValueError(
-                f"chunk {c['chunk_index']} has no summary_vec. "
-                "Please re-encode with the updated kvcache_generate_td.py."
-            )
-        indices.append(int(c["chunk_index"]))
-        vecs.append(torch.tensor(sv, dtype=torch.float32))
+    return chunks
 
-    return indices, torch.stack(vecs, dim=0)   # [N, D]
+
+def _load_chunk_layer_key_vecs(kv_cache_dir: str):
+    """
+    ReKV internal 风格：直接从每个 chunk shard 提取逐层 K 向量均值。
+
+    Returns
+    -------
+    chunk_indices : List[int]
+    layer_key_vecs: torch.Tensor  [N, L, Hkv, D]
+    """
+    from kvcache_retrieve_td import _load_single_safetensors_kv
+
+    chunks = _load_manifest_chunks(kv_cache_dir)
+    chunk_indices = []
+    layer_vecs = []
+    for c in chunks:
+        chunk_idx = int(c["chunk_index"])
+        shard_path = os.path.join(kv_cache_dir, c["file"])
+        shard_kv, _ = _load_single_safetensors_kv(shard_path, map_location="cpu")
+        # shard_kv: tuple[L] of (k,v), k shape=[B,Hkv,T,D]
+        per_layer = []
+        for layer_k, _ in shard_kv:
+            per_layer.append(layer_k[0].mean(dim=1).float())  # [Hkv, D]
+        chunk_indices.append(chunk_idx)
+        layer_vecs.append(torch.stack(per_layer, dim=0))      # [L, Hkv, D]
+
+    return chunk_indices, torch.stack(layer_vecs, dim=0)      # [N, L, Hkv, D]
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +118,39 @@ def _group_query_to_kv_heads(query_states: torch.Tensor, num_kv_heads: int) -> t
     return grouped.mean(dim=0).mean(dim=1).float()  # [num_kv_heads, head_dim]
 
 
+def _load_tail_kv_as_past(kv_cache_dir: str, map_location="cpu"):
+    """
+    按 manifest 中 window_size 加载视频尾部若干 chunk 作为 retrieval 的 past context。
+    若无 window_size，则退化为只加载最后一个 chunk（兼容旧数据）。
+    """
+    from kvcache_retrieve_td import _load_single_safetensors_kv, _concat_kv_segments
+
+    manifest_path = os.path.join(kv_cache_dir, "manifest.json")
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    chunks = sorted(manifest.get("chunks", []), key=lambda c: int(c["chunk_index"]))
+    if not chunks:
+        raise ValueError(f"No chunks found in manifest: {manifest_path}")
+
+    common_metadata = manifest.get("common_metadata", {}) or {}
+    window_size = common_metadata.get("window_size")
+    if window_size is None:
+        selected = [chunks[-1]]
+    else:
+        selected = chunks[-int(window_size):]
+
+    kv_segments = []
+    for c in selected:
+        shard_path = os.path.join(kv_cache_dir, c["file"])
+        shard_kv, _ = _load_single_safetensors_kv(shard_path, map_location=map_location)
+        kv_segments.append(shard_kv)
+
+    past_kv = _concat_kv_segments(kv_segments)
+    full_merged_seq_len = common_metadata.get("full_merged_seq_len")
+    return past_kv, full_merged_seq_len
+
+
 def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> torch.Tensor:
     """
     以最后一个 chunk 的 KV 作为 past_key_values，对 question 做 forward，
@@ -124,21 +169,15 @@ def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> to
       cosine(Q_question, K_chunk_i) 才能反映问题与各段视频的语义相关性。
       这与 ReKV 论文的内部检索方式一致。
     """
-    from kvcache_retrieve_td import _load_single_safetensors_kv, move_to_device, _to_model_cache
+    from kvcache_retrieve_td import move_to_device, _to_model_cache
 
-    # 加载最后一个 chunk 的 KV 作为 past context
-    manifest_path = os.path.join(kv_cache_dir, "manifest.json")
-    with open(manifest_path, "r", encoding="utf-8") as f:
-        manifest = json.load(f)
-    chunks_sorted = sorted(manifest["chunks"], key=lambda c: int(c["chunk_index"]))
-    last_chunk = chunks_sorted[-1]
-    last_shard_path = os.path.join(kv_cache_dir, last_chunk["file"])
-    last_kv, _ = _load_single_safetensors_kv(last_shard_path, map_location="cpu")
+    # 加载尾部窗口 KV 作为 past context（与 encode window 设置对齐）
+    tail_kv, full_merged_seq_len = _load_tail_kv_as_past(kv_cache_dir, map_location="cpu")
 
     device = next(model.parameters()).device
-    last_kv = move_to_device(last_kv, device)
-    past_seq_len = int(last_kv[0][0].shape[-2])
-    model_past_key_values = _to_model_cache(last_kv)
+    tail_kv = move_to_device(tail_kv, device)
+    local_past_seq_len = int(tail_kv[0][0].shape[-2]) if tail_kv else 0
+    model_past_key_values = _to_model_cache(tail_kv)
 
     suffix = "\n问题：" + question
     inputs = processor(text=[suffix], return_tensors="pt")
@@ -147,7 +186,7 @@ def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> to
     # attention_mask 覆盖 [past | question]
     current_len = inputs["input_ids"].shape[1]
     inputs["attention_mask"] = torch.ones(
-        (1, past_seq_len + current_len),
+        (1, local_past_seq_len + current_len),
         dtype=inputs["attention_mask"].dtype,
         device=device,
     )
@@ -157,9 +196,9 @@ def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> to
     # 2) 对每层 hidden_states 通过 self_attn.q_proj 得到 Q
     # 3) 用与解码一致的 position_ids 做 RoPE（关键）
     # 4) 将 Q heads 聚合到 KV heads 维度，再跨层平均
-    position_ids = torch.arange(
-        past_seq_len, past_seq_len + current_len, device=device, dtype=torch.long
-    ).unsqueeze(0)
+    # 绝对位置起点优先使用 manifest 里真实 full_merged_seq_len，避免 window 模式下位置回绕
+    absolute_start = int(full_merged_seq_len) if full_merged_seq_len is not None else local_past_seq_len
+    position_ids = torch.arange(absolute_start, absolute_start + current_len, device=device, dtype=torch.long).unsqueeze(0)
 
     with torch.no_grad():
         outputs = model(
@@ -205,9 +244,9 @@ def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> to
         q_grouped = _group_query_to_kv_heads(q_states, attn.num_key_value_heads)  # [Hkv, D]
         q_means.append(q_grouped)
 
-    query_vec = torch.stack(q_means, dim=0).mean(dim=0).flatten().cpu()
-    del outputs, hidden_states, last_kv
-    return query_vec.float()
+    query_layer_vecs = torch.stack(q_means, dim=0).cpu().float()  # [L, Hkv, D]
+    del outputs, hidden_states, tail_kv
+    return query_layer_vecs
 
 
 # ---------------------------------------------------------------------------
@@ -244,25 +283,27 @@ def select_chunks(
     -------
     List[int]  按 chunk_index 升序排列（保留视频时序）。
     """
-    # 1. 加载所有 chunk 的 summary_vec
-    all_indices, summary_vecs = _load_summary_vecs(kv_cache_dir)   # [N, D]
+    # 1. 加载每个 chunk 的逐层 K 向量均值
+    all_indices, chunk_layer_key_vecs = _load_chunk_layer_key_vecs(kv_cache_dir)   # [N, L, Hkv, D]
     n_chunks = len(all_indices)
 
     if top_k >= n_chunks:
         print(f"[select_chunks] top_k={top_k} >= total chunks={n_chunks}, returning all.")
         return all_indices
 
-    # 2. 计算 question 的 Q 向量（以视频末尾为位置上下文）
-    query_vec = _compute_query_vec(question, processor, model, kv_cache_dir)
+    # 2. 计算 question 的逐层 Q 向量（以视频末尾位置作为绝对坐标）
+    query_layer_vecs = _compute_query_vec(question, processor, model, kv_cache_dir)  # [L, Hkv, D]
 
-    # 3. Q_question · K_chunk —— 真实 attention score 的代理
-    # summary_vecs[i] 是 chunk i 的 K 向量均值（encode 时存入 manifest）
-    # query_vec 是 question 的 Q 向量均值
-    # 点积度量"question 会对这个 chunk 投入多少 attention"
-    # 归一化后等价于 cosine，但保留幅度信息也可选择不归一化
-    query_norm = F.normalize(query_vec.unsqueeze(0), dim=1)    # [1, D]
-    chunk_norm = F.normalize(summary_vecs, dim=1)              # [N, D]
-    sim = (query_norm * chunk_norm).sum(dim=1)                  # [N]
+    # 3. ReKV-style per-layer QK 相似度：
+    #    逐层 cosine 后取平均，减少“跨层平均后被位置主导”的现象。
+    q = query_layer_vecs.reshape(query_layer_vecs.shape[0], -1)                # [L, D']
+    c = chunk_layer_key_vecs.reshape(chunk_layer_key_vecs.shape[0], q.shape[0], -1)  # [N, L, D']
+    # 轻量去中心化：减去 chunk 集合均值，降低单调时间位置偏置
+    c_center = c - c.mean(dim=0, keepdim=True)
+    q_center = q - c.mean(dim=0)
+    q_norm = F.normalize(q_center, dim=1)                     # [L, D']
+    c_norm = F.normalize(c_center, dim=2)                     # [N, L, D']
+    sim = (c_norm * q_norm.unsqueeze(0)).sum(dim=2).mean(dim=1)  # [N]
 
     print("[select_chunks] Cosine similarities:")
     for idx, s in zip(all_indices, sim.tolist()):
