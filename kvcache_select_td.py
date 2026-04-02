@@ -124,7 +124,7 @@ def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> to
       cosine(Q_question, K_chunk_i) 才能反映问题与各段视频的语义相关性。
       这与 ReKV 论文的内部检索方式一致。
     """
-    from kvcache_retrieve_td import _load_single_safetensors_kv, move_to_device
+    from kvcache_retrieve_td import _load_single_safetensors_kv, move_to_device, _to_model_cache
 
     # 加载最后一个 chunk 的 KV 作为 past context
     manifest_path = os.path.join(kv_cache_dir, "manifest.json")
@@ -138,6 +138,7 @@ def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> to
     device = next(model.parameters()).device
     last_kv = move_to_device(last_kv, device)
     past_seq_len = int(last_kv[0][0].shape[-2])
+    model_past_key_values = _to_model_cache(last_kv)
 
     suffix = "\n问题：" + question
     inputs = processor(text=[suffix], return_tensors="pt")
@@ -163,7 +164,7 @@ def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> to
     with torch.no_grad():
         outputs = model(
             **inputs,
-            past_key_values=last_kv,
+            past_key_values=model_past_key_values,
             use_cache=False,
             output_hidden_states=True,
             return_dict=True,

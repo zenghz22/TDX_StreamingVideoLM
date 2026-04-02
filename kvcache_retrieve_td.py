@@ -8,6 +8,26 @@ import torch
 from safetensors import safe_open
 
 
+def _to_model_cache(past_key_values):
+    """
+    兼容 transformers 新旧 cache API：
+    - 旧版：past_key_values 为 tuple/list
+    - 新版（如较新 Qwen2）：要求传入 Cache 对象（如 DynamicCache）
+    """
+    if past_key_values is None:
+        return None
+
+    if not isinstance(past_key_values, (tuple, list)):
+        return past_key_values
+
+    try:
+        from transformers.cache_utils import DynamicCache
+        return DynamicCache.from_legacy_cache(past_key_values)
+    except Exception:
+        # 旧版 transformers 无 cache_utils 或不支持 from_legacy_cache，回退 legacy tuple
+        return past_key_values
+
+
 def move_to_device(obj, device):
     if isinstance(obj, torch.Tensor):
         return obj.to(device)
@@ -226,6 +246,7 @@ def decode_kvcache(
 
     device = next(model.parameters()).device
     kv_cache = move_to_device(kv_cache, device)
+    model_past_key_values = _to_model_cache(kv_cache)
 
     suffix = _build_decode_suffix(question)
     model_inputs = processor(text=[suffix], return_tensors="pt")
@@ -252,7 +273,7 @@ def decode_kvcache(
     with torch.no_grad():
         outputs = model(
             **model_inputs,
-            past_key_values=kv_cache,
+            past_key_values=model_past_key_values,
             use_cache=True,
             return_dict=True,
         )
