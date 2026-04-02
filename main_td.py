@@ -6,6 +6,7 @@ import argparse
 from kvcache_generate_td import ENCODE_PREFIX, load_model, load_video
 from kvcache_manager_td import encode_video_managed
 from kvcache_retrieve_td import decode_kvcache
+from kvcache_select_td import select_chunks
 from zhz_hardware_eval_utils import *
 from zhz_model_eval_utils import *
 
@@ -18,6 +19,10 @@ from zhz_model_eval_utils import *
 #   None  → 全量 attention（精度最高，内存无界）
 #   W > 0 → 局部 attention（精度略降，内存严格有界）
 #   推荐：max_in_memory = window_size + 1，给 delta 留一个空位。
+
+# select_chunks: decode 时是否先选 chunk。
+#  0 → 不选，加载全部 chunk（原有行为）
+#  K > 0 → 选 top-K 个 chunk，峰值内存随 K 线性降低
 
 # decode 阶段：指定只加载哪些 chunk 的 KV
 # None  → 加载全部 chunk（原有行为）
@@ -43,71 +48,82 @@ if __name__ == "__main__":
     model_path    = "llava-hf/llava-onevision-qwen2-7b-ov-hf"
     video_path    = "../data/muffin.mp4"
     kv_cache_path = "../data/kv_cache_chunks"
-    question      = "What is the chef doing?"
+    question      = "Who is the green toy character appearing in the video?"
+    #question      = "How many eggs are there in the video?"
+    #question      = "What is the tool used to extract the yolk from the egg?"
 
     parser = argparse.ArgumentParser(description="TD-side video encoding and decoding")
-    parser.add_argument("--max_in_memory", type=int, default=10)
-    parser.add_argument("--window_size", type=int, default=0)
+    parser.add_argument("--mode", type=str, default="encode_decode",choices=["encode_decode","decode","encode"])
     parser.add_argument("--plot_file", type=str, default=None)
-    parser.add_argument("--decode_indices", type=str, default=None)      
+    parser.add_argument("--encode_memory", type=int, default=64)
+    parser.add_argument("--encode_window", type=int, default=0)
+    parser.add_argument("--decode_indices", type=str, default="full")
+    parser.add_argument("--decode_select", type=int, default=0)          
     args = parser.parse_args()
 
-    with measure_resources("Encode Video", logger=logger, plot_file=args.plot_file) as monitor:
-        '''
-        # ── 编码阶段 ──────────────────────────────────────────────────────
-        monitor["mark"]("load_model_encode")
-        processor, model = load_model(model_path, load_weights=True)
-        inject_timing_hook_to_model(model, event_callback=monitor["mark"])
+    if args.mode == "encode_decode" or args.mode == "encode":
+        with measure_resources("Encode Video", logger=logger, plot_file=args.plot_file) as monitor:
+            # ── 编码阶段 ──────────────────────────────────────────────────────
+            monitor["mark"]("load_model_encode")
+            processor, model = load_model(model_path, load_weights=True)
+            inject_timing_hook_to_model(model, event_callback=monitor["mark"])
 
-        video = load_video(video_path, sample_fps=30)
+            video = load_video(video_path, sample_fps=30)
 
-        monitor["mark"]("kvcache_encode_start")
-        manager = encode_video_managed(
-            video,
-            processor,
-            model=model,
-            chunk_size=16,
-            encode_prefix=ENCODE_PREFIX,
-            stage_mark=monitor["mark"],
-            kv_cache_dir=kv_cache_path,
-            #max_in_memory=MAX_IN_MEMORY,
-            #window_size=WINDOW_SIZE,
-            max_in_memory=args.max_in_memory,
-            window_size=args.window_size if args.window_size > 0 else None,
-        )
-        monitor["mark"]("kvcache_encode_done")
-
-        #logger.info(f"Encode finished. Manager stats: {manager.stats()}")
-
-        remove_timing_hooks_from_model()
-        del model, manager
-        gc.collect()
-        time.sleep(10)
-        '''
-        # ── 解码阶段──────────────────────────────────────────────
-        monitor["mark"]("load_model_decode")
-        processor, model = load_model(model_path, load_weights=True)
-        inject_timing_hook_to_model(model)
-
-        monitor["mark"]("kvcache_decode")
-        DECODE_CHUNK_INDICES = (
-            [int(x) for x in args.decode_indices.split(",")]
-            if args.decode_indices is not None and args.decode_indices != ""
-            else None
-        )
-        answer = decode_kvcache(
-            kv_cache_path, 
-            question, 
-            processor, 
-            model,
-            max_new_tokens=32,
-            min_new_tokens=32,
-            temperature=0.0,
-            chunk_indices=DECODE_CHUNK_INDICES,
+            monitor["mark"]("kvcache_encode_start")
+            manager = encode_video_managed(
+                video,
+                processor,
+                model=model,
+                chunk_size=16,
+                encode_prefix=ENCODE_PREFIX,
+                stage_mark=monitor["mark"],
+                kv_cache_dir=kv_cache_path,
+                max_in_memory=args.encode_memory,
+                window_size=args.encode_window if args.encode_window > 0 else None,
             )
+            monitor["mark"]("kvcache_encode_done")
 
-        print("Answer:", answer)
+            #logger.info(f"Encode finished. Manager stats: {manager.stats()}")
 
-        remove_timing_hooks_from_model()
-        del model
-        gc.collect()
+            remove_timing_hooks_from_model()
+            del model, manager
+            gc.collect()
+            time.sleep(10)
+
+    if args.mode == "encode_decode" or args.mode == "decode":
+        with measure_resources("Decode Video", logger=logger, plot_file=args.plot_file) as monitor:
+        # —— 解码阶段 ──────────────────────────────────────────────────────
+            monitor["mark"]("load_model_decode")
+            processor, model = load_model(model_path, load_weights=True)
+            inject_timing_hook_to_model(model)
+
+            if args.decode_indices != "full":
+                decode_chunk_ids = [int(idx) for idx in args.decode_indices.split(",")]
+                logger.info(f"Decoding with specified chunk indices: {decode_chunk_ids}")
+
+            elif args.decode_select > 0:
+                monitor["mark"]("kvcache_select")
+                decode_chunk_ids = select_chunks(kv_cache_path, question, processor, model, top_k=args.decode_select, always_include_first=True)
+                logger.info(f"Decoding with top-{args.decode_select} selected chunks based on question relevance.")
+            else:
+                decode_chunk_ids = None  # None 表示加载全部 chunk
+                logger.info("Decoding with all chunks.")
+
+            monitor["mark"]("kvcache_decode")
+            answer = decode_kvcache(
+                kv_cache_path, 
+                question, 
+                processor, 
+                model,
+                max_new_tokens=32,
+                min_new_tokens=32,
+                temperature=0.0,
+                chunk_indices=decode_chunk_ids,
+                )
+
+            print("Answer:", answer)
+
+            remove_timing_hooks_from_model()
+            del model
+            gc.collect()

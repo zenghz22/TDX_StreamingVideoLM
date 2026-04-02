@@ -276,10 +276,20 @@ def encode_video(
                 )
                 delta_seq_len = int(delta_kv[0][0].shape[-2])
 
+                # ---- chunk summary vector（供 kvcache_select_td 检索使用）----
+                # 使用 K 向量（ReKV ICLR'25 Eq.2）：
+                # mean(K_tokens) per layer → mean across layers → flatten
+                k_means = []
+                for layer_k, _ in delta_kv:
+                    # layer_k: [batch, num_kv_heads, seq, head_dim]
+                    k_means.append(layer_k[0].mean(dim=1))  # [num_kv_heads, head_dim]
+                chunk_summary_vec = torch.stack(k_means, dim=0).mean(dim=0).flatten()
+                chunk_summary_vec = chunk_summary_vec.float()
+
                 print(f"[chunk {i}] full_kv_seq_len: {full_kv_seq_len}")
                 print(f"[chunk {i}] delta_seq_len (this chunk merged): {delta_seq_len}")
+                print(f"[chunk {i}] summary_vec shape: {tuple(chunk_summary_vec.shape)}")
 
-                # 更新 manager 的真实 merged seq len
                 if use_manager:
                     manager.update_full_merged_seq_len(delta_seq_len)
 
@@ -287,6 +297,7 @@ def encode_video(
                 delta_kv = None
                 full_kv_seq_len = 0
                 delta_seq_len = 0
+                chunk_summary_vec = None
 
             # ----------------------------------------------------------------
             # 显式释放大对象引用，让 GC 能立即回收 tensor 内存
@@ -344,6 +355,8 @@ def encode_video(
                         "seq_end": int(full_kv_seq_len),
                         "past_seq_len": shard_metadata.get("past_seq_len"),
                         "layer0_key_shape": shard_metadata.get("layer0_key_shape"),
+                        # ReKV-style summary vector：跨层 K 均值，用于 prompt-aware 检索
+                        "summary_vec": chunk_summary_vec.tolist() if chunk_summary_vec is not None else None,
                     }
                 )
 
@@ -375,6 +388,14 @@ def encode_video(
             manager.remove_position_hook()
 
     if kv_cache_dir is not None:
+        # 把真实的 full_merged_seq_len 写入 common_metadata，
+        # retrieve 侧直接读取，无需从 delta_seq_len 反推。
+        if use_manager:
+            common_metadata["full_merged_seq_len"] = manager._full_merged_seq_len
+        else:
+            # 无 manager 时，全量模式下 full_merged_seq_len = 最后一个 chunk 的 seq_end
+            if chunk_records:
+                common_metadata["full_merged_seq_len"] = chunk_records[-1]["seq_end"]
         _write_chunk_manifest(kv_cache_dir, chunk_records, common_metadata)
 
     # manager 模式下返回 None（KV 由 manager 管理，不在内存中累积）

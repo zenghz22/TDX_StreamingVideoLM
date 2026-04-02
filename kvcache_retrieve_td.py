@@ -163,7 +163,7 @@ def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_ind
 
 def _build_decode_suffix(question):
     # 与编码前缀配套的续写格式，避免 chat-template 与 KV 上下文不匹配。
-    return "\n问题：" + question + "\n回答："
+    return "\nQuestion: " + question + "\nAnswer: "
 
 
 def _get_past_seq_len(kv_cache, metadata):
