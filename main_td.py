@@ -48,9 +48,10 @@ if __name__ == "__main__":
     model_path    = "llava-hf/llava-onevision-qwen2-7b-ov-hf"
     video_path    = "../data/muffin.mp4"
     kv_cache_path = "../data/kv_cache_chunks"
-    question      = "Who is the green toy character appearing in the video?"
+    #question      = "Who is the green toy character appearing in the video?"
     #question      = "How many eggs are there in the video?"
     #question      = "What is the tool used to extract the yolk from the egg?"
+    question      = "What is the material of the spoon at the end of the video?"
 
     parser = argparse.ArgumentParser(description="TD-side video encoding and decoding")
     parser.add_argument("--mode", type=str, default="encode_decode",choices=["encode_decode","decode","encode"])
