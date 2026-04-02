@@ -48,9 +48,10 @@ if __name__ == "__main__":
     model_path    = "llava-hf/llava-onevision-qwen2-7b-ov-hf"
     video_path    = "../data/muffin.mp4"
     kv_cache_path = "../data/kv_cache_chunks"
-    question      = "Who is the green toy character appearing in the video?"
+    #question      = "Who is the green toy character appearing in the video?"
     #question      = "How many eggs are there in the video?"
     #question      = "What is the tool used to extract the yolk from the egg?"
+    question      = "What is the material of the spoon at the end of the video?"
 
     parser = argparse.ArgumentParser(description="TD-side video encoding and decoding")
     parser.add_argument("--mode", type=str, default="encode_decode",choices=["encode_decode","decode","encode"])
@@ -59,7 +60,6 @@ if __name__ == "__main__":
     parser.add_argument("--encode_window", type=int, default=0)
     parser.add_argument("--decode_indices", type=str, default="full")
     parser.add_argument("--decode_select", type=int, default=0)
-    parser.add_argument("--decode_strategy", type=str, default="sample", choices=["sample", "greedy"])
     args = parser.parse_args()
 
     if args.mode == "encode_decode" or args.mode == "encode":
@@ -120,7 +120,7 @@ if __name__ == "__main__":
                 max_new_tokens=32,
                 min_new_tokens=32,
                 temperature=0.0,
-                decode_strategy=args.decode_strategy,
+                decode_strategy="greedy",
                 chunk_indices=decode_chunk_ids,
                 )
 
