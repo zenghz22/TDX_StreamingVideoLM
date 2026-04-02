@@ -58,7 +58,7 @@ if __name__ == "__main__":
     parser.add_argument("--encode_memory", type=int, default=64)
     parser.add_argument("--encode_window", type=int, default=0)
     parser.add_argument("--decode_indices", type=str, default="full")
-    parser.add_argument("--decode_select", type=int, default=0)          
+    parser.add_argument("--decode_select", type=int, default=0)
     args = parser.parse_args()
 
     if args.mode == "encode_decode" or args.mode == "encode":
@@ -119,6 +119,7 @@ if __name__ == "__main__":
                 max_new_tokens=32,
                 min_new_tokens=32,
                 temperature=0.0,
+                decode_strategy="greedy",
                 chunk_indices=decode_chunk_ids,
                 )
 

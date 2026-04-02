@@ -306,11 +306,9 @@ def encode_video(
             # past_kv      → 本轮传给 model 的窗口/全量 KV concat 结果
             # model_inputs → 含 pixel_values 等大型 tensor
             # ----------------------------------------------------------------
-            del outputs, full_kv_after
-            if use_manager and past_kv is not None:
-                del past_kv
-            del model_inputs, pixel_values
-            gc.collect()
+            # 原有模式：更新全量 kv_cache（必须先于 full_kv_after 释放）
+            if not use_manager:
+                kv_cache = full_kv_after
 
             # ----------------------------------------------------------------
             # 保存 delta 到磁盘 & 更新状态
@@ -370,9 +368,11 @@ def encode_video(
                         seq_end=int(full_kv_seq_len),
                     )
 
-            # 原有模式：更新全量 kv_cache
-            if not use_manager:
-                kv_cache = full_kv_after
+            del outputs, full_kv_after
+            if use_manager and past_kv is not None:
+                del past_kv
+            del model_inputs, pixel_values
+            gc.collect()
 
             # 打印 manager 状态（便于调试）
             if use_manager:
