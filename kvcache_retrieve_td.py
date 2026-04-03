@@ -8,6 +8,26 @@ import torch
 from safetensors import safe_open
 
 
+def _to_model_cache(past_key_values):
+    """
+    兼容 transformers 新旧 cache API：
+    - 旧版：past_key_values 为 tuple/list
+    - 新版（如较新 Qwen2）：要求传入 Cache 对象（如 DynamicCache）
+    """
+    if past_key_values is None:
+        return None
+
+    if not isinstance(past_key_values, (tuple, list)):
+        return past_key_values
+
+    try:
+        from transformers.cache_utils import DynamicCache
+        return DynamicCache.from_legacy_cache(past_key_values)
+    except Exception:
+        # 旧版 transformers 无 cache_utils 或不支持 from_legacy_cache，回退 legacy tuple
+        return past_key_values
+
+
 def move_to_device(obj, device):
     if isinstance(obj, torch.Tensor):
         return obj.to(device)
@@ -199,6 +219,7 @@ def decode_kvcache(
     temperature=0.7,
     top_p=0.9,
     repetition_penalty=1.1,
+    decode_strategy="sample",
 ):
     """加载 KV cache，直接文本解码，跳过视频预处理与编码。
 
@@ -206,6 +227,10 @@ def decode_kvcache(
         指定只加载哪些 chunk 的 KV（例如 [0, 3, 7]）。
         None 表示加载全部（原有行为）。
         加载的 chunk 越少，decode 阶段峰值内存越低。
+    decode_strategy : str
+        生成策略：
+          - "sample": 采样（temperature/top_p/repetition_penalty 生效）
+          - "greedy": 贪心（忽略 top_p，temperature/repetition_penalty 不生效）
     """
     kv_cache, metadata = load_kv_cache(
         kv_cache_path, map_location="cpu",
@@ -221,6 +246,7 @@ def decode_kvcache(
 
     device = next(model.parameters()).device
     kv_cache = move_to_device(kv_cache, device)
+    model_past_key_values = _to_model_cache(kv_cache)
 
     suffix = _build_decode_suffix(question)
     model_inputs = processor(text=[suffix], return_tensors="pt")
@@ -241,10 +267,13 @@ def decode_kvcache(
 
     print(f"decode past_seq_len: {past_seq_len}, current_seq_len: {current_seq_len}")
 
+    if decode_strategy not in {"sample", "greedy"}:
+        raise ValueError(f"Unsupported decode_strategy={decode_strategy}, expected one of ['sample', 'greedy'].")
+
     with torch.no_grad():
         outputs = model(
             **model_inputs,
-            past_key_values=kv_cache,
+            past_key_values=model_past_key_values,
             use_cache=True,
             return_dict=True,
         )
@@ -254,11 +283,18 @@ def decode_kvcache(
         generated_token_ids = []
 
         logits = outputs.logits[:, -1, :]
-        logits = logits / max(temperature, 1e-5)
-        probs = torch.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
+        if decode_strategy == "greedy":
+            if repetition_penalty > 1.0:
+                for tid in set(generated_token_ids):
+                    logits[:, tid] = logits[:, tid] / repetition_penalty
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+        else:
+            logits = logits / max(temperature, 1e-5)
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
         generated.append(next_token)
         generated_token_ids.append(int(next_token.item()))
+        repeat_streak = 1
 
         for step_idx in range(max_new_tokens - 1):
             step_attention_mask = torch.ones(
@@ -276,31 +312,44 @@ def decode_kvcache(
             past = step_outputs.past_key_values
             logits = step_outputs.logits[:, -1, :]
 
-            # repetition penalty: 降低已生成 token 再次被选中的概率。
-            if repetition_penalty > 1.0:
-                for tid in set(generated_token_ids):
-                    logits[:, tid] = logits[:, tid] / repetition_penalty
+            if decode_strategy == "greedy":
+                if repetition_penalty > 1.0:
+                    for tid in set(generated_token_ids):
+                        logits[:, tid] = logits[:, tid] / repetition_penalty
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
+                # repetition penalty: 降低已生成 token 再次被选中的概率。
+                if repetition_penalty > 1.0:
+                    for tid in set(generated_token_ids):
+                        logits[:, tid] = logits[:, tid] / repetition_penalty
 
-            logits = logits / max(temperature, 1e-5)
+                logits = logits / max(temperature, 1e-5)
 
-            # nucleus sampling (top-p)
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                sorted_probs = torch.softmax(sorted_logits, dim=-1)
-                cum_probs = torch.cumsum(sorted_probs, dim=-1)
-                sorted_remove = cum_probs > top_p
-                sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
-                sorted_remove[..., 0] = False
-                sorted_logits[sorted_remove] = -1e10
-                logits = torch.full_like(logits, -1e10).scatter(1, sorted_indices, sorted_logits)
+                # nucleus sampling (top-p)
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                    cum_probs = torch.cumsum(sorted_probs, dim=-1)
+                    sorted_remove = cum_probs > top_p
+                    sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+                    sorted_remove[..., 0] = False
+                    sorted_logits[sorted_remove] = -1e10
+                    logits = torch.full_like(logits, -1e10).scatter(1, sorted_indices, sorted_logits)
 
-            probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+                probs = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
             generated.append(next_token)
             generated_token_ids.append(int(next_token.item()))
+            if len(generated_token_ids) >= 2 and generated_token_ids[-1] == generated_token_ids[-2]:
+                repeat_streak += 1
+            else:
+                repeat_streak = 1
 
             eos_id = getattr(model.generation_config, "eos_token_id", None)
             if eos_id is not None and int(next_token.item()) == int(eos_id) and (step_idx + 1) >= min_new_tokens:
+                break
+            # greedy 模式下，防止长时间重复同一 token 导致乱码死循环
+            if decode_strategy == "greedy" and repeat_streak >= 6 and (step_idx + 1) >= min_new_tokens:
                 break
 
     answer_ids = torch.cat(generated, dim=1)[0]

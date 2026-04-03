@@ -126,6 +126,32 @@ def _write_chunk_manifest(kv_cache_dir, chunks, common_metadata):
     print(f"KV chunk manifest saved to {manifest_path}")
 
 
+def _write_retrieval_index(kv_cache_dir, chunk_indices, layer_key_vecs, summary_vecs, common_metadata):
+    """
+    将 select 所需的轻量向量索引写入独立文件（方案 A + C）：
+      - chunk_indices : [N]
+      - layer_key_vecs: [N, L, Hkv, D]
+      - summary_vecs  : [N, Hkv*D]
+    """
+    if not chunk_indices:
+        return
+
+    index_path = os.path.join(kv_cache_dir, "retrieval_index.safetensors")
+    tensors = {
+        "chunk_indices": torch.tensor(chunk_indices, dtype=torch.int64).contiguous(),
+        "layer_key_vecs": torch.stack(layer_key_vecs, dim=0).float().contiguous(),
+        "summary_vecs": torch.stack(summary_vecs, dim=0).float().contiguous(),
+    }
+    metadata = {
+        "format": "retrieval_index_v1",
+        "num_chunks": len(chunk_indices),
+        "common_metadata": common_metadata or {},
+    }
+    metadata_str = {k: json.dumps(v, ensure_ascii=False) for k, v in metadata.items()}
+    save_file(tensors, index_path, metadata=metadata_str)
+    print(f"Retrieval index saved to {index_path}")
+
+
 # ---------------------------------------------------------------------------
 # encode_video — 支持 KVCacheManager（可选）
 # ---------------------------------------------------------------------------
@@ -168,6 +194,9 @@ def encode_video(
     num_chunks = (num_frames + chunk_size - 1) // chunk_size
     chunk_records = []
     common_metadata = {}
+    retrieval_chunk_indices = []
+    retrieval_layer_key_vecs = []
+    retrieval_summary_vecs = []
 
     # 安装 sliding window position hook（仅 manager + window_size 模式）
     use_manager = manager is not None and model is not None
@@ -283,7 +312,8 @@ def encode_video(
                 for layer_k, _ in delta_kv:
                     # layer_k: [batch, num_kv_heads, seq, head_dim]
                     k_means.append(layer_k[0].mean(dim=1))  # [num_kv_heads, head_dim]
-                chunk_summary_vec = torch.stack(k_means, dim=0).mean(dim=0).flatten()
+                chunk_layer_key_vec = torch.stack(k_means, dim=0).float()   # [L, Hkv, D]
+                chunk_summary_vec = chunk_layer_key_vec.mean(dim=0).flatten()
                 chunk_summary_vec = chunk_summary_vec.float()
 
                 print(f"[chunk {i}] full_kv_seq_len: {full_kv_seq_len}")
@@ -306,11 +336,9 @@ def encode_video(
             # past_kv      → 本轮传给 model 的窗口/全量 KV concat 结果
             # model_inputs → 含 pixel_values 等大型 tensor
             # ----------------------------------------------------------------
-            del outputs, full_kv_after
-            if use_manager and past_kv is not None:
-                del past_kv
-            del model_inputs, pixel_values
-            gc.collect()
+            # 原有模式：更新全量 kv_cache（必须先于 full_kv_after 释放）
+            if not use_manager:
+                kv_cache = full_kv_after
 
             # ----------------------------------------------------------------
             # 保存 delta 到磁盘 & 更新状态
@@ -359,6 +387,9 @@ def encode_video(
                         "summary_vec": chunk_summary_vec.tolist() if chunk_summary_vec is not None else None,
                     }
                 )
+                retrieval_chunk_indices.append(i)
+                retrieval_layer_key_vecs.append(chunk_layer_key_vec.cpu().contiguous())
+                retrieval_summary_vecs.append(chunk_summary_vec.cpu().contiguous())
 
                 # 注册到 manager（manager 负责内存调度）
                 if use_manager:
@@ -370,9 +401,11 @@ def encode_video(
                         seq_end=int(full_kv_seq_len),
                     )
 
-            # 原有模式：更新全量 kv_cache
-            if not use_manager:
-                kv_cache = full_kv_after
+            del outputs, full_kv_after
+            if use_manager and past_kv is not None:
+                del past_kv
+            del model_inputs, pixel_values
+            gc.collect()
 
             # 打印 manager 状态（便于调试）
             if use_manager:
@@ -397,6 +430,13 @@ def encode_video(
             if chunk_records:
                 common_metadata["full_merged_seq_len"] = chunk_records[-1]["seq_end"]
         _write_chunk_manifest(kv_cache_dir, chunk_records, common_metadata)
+        _write_retrieval_index(
+            kv_cache_dir,
+            retrieval_chunk_indices,
+            retrieval_layer_key_vecs,
+            retrieval_summary_vecs,
+            common_metadata,
+        )
 
     # manager 模式下返回 None（KV 由 manager 管理，不在内存中累积）
     if use_manager:
