@@ -182,6 +182,8 @@ def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> to
     suffix = "\n问题：" + question
     inputs = processor(text=[suffix], return_tensors="pt")
     inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
+    current_len = int(inputs["input_ids"].shape[1])
+    position_ids = torch.arange(current_len, device=device, dtype=torch.long).unsqueeze(0)
 
     # ---------------- ReKV Internal-style: 仅输入 question，提取 Q 向量 ----------------
     # 1) 先做一次 forward，拿到每层 hidden_states（layer 输入）
@@ -220,11 +222,12 @@ def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> to
             ).transpose(1, 2)
 
             # Qwen2Attention.rotary_emb 在不同版本 transformers 参数签名略有差异：
-            # 这里优先按 question-only 的默认位置调用。
+            # 对当前环境（Qwen2RotaryEmbedding）显式传入 position_ids。
             try:
-                cos, sin = attn.rotary_emb(k_dummy)
+                cos, sin = attn.rotary_emb(k_dummy, position_ids)
             except TypeError:
-                cos, sin = attn.rotary_emb(k_dummy, None)
+                # 兼容可能需要更多参数的位置编码实现，至少保证 position_ids 不为 None
+                cos, sin = attn.rotary_emb(k_dummy, position_ids=position_ids)
 
             q_states, _ = apply_rotary_pos_emb(q_states, k_dummy, cos, sin)
 
