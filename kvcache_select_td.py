@@ -153,8 +153,8 @@ def _load_tail_kv_as_past(kv_cache_dir: str, map_location="cpu"):
 
 def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> torch.Tensor:
     """
-    以最后一个 chunk 的 KV 作为 past_key_values，对 question 做 forward，
-    提取各层新增的 Q 向量（即 question tokens 的 Q），跨层跨 token 均值后返回。
+    ReKV internal 风格：仅输入 question 做 retrieval forward，
+    提取各层 question tokens 的 Q 向量，跨层跨 token 均值后返回。
 
     为什么必须带 past context：
       Qwen2 使用 RoPE，Q/K 向量都依赖 token 的绝对位置。
@@ -163,51 +163,28 @@ def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> to
       与 video K 向量的位置差距极大，cosine similarity 由位置主导而非内容，
       导致无论问什么问题相似度都单调递减。
 
-      以最后一个 chunk 的 KV 作为 past context forward question，
-      question tokens 的位置 ID 从 video 末尾（pos≈N）开始，
-      与各 video chunk 的位置差距变为有意义的时序距离，
-      cosine(Q_question, K_chunk_i) 才能反映问题与各段视频的语义相关性。
-      这与 ReKV 论文的内部检索方式一致。
+      若直接使用视频尾部 past context，检索会偏向最近窗口（top-k 常被最后几块占据）。
+      因此这里按 ReKV 实践仅输入 question 做检索向量，
+      再与各 chunk K 向量做逐层匹配，降低时间位置偏置。
     """
-    from kvcache_retrieve_td import move_to_device, _to_model_cache
-
-    # 加载尾部窗口 KV 作为 past context（与 encode window 设置对齐）
-    tail_kv, full_merged_seq_len = _load_tail_kv_as_past(kv_cache_dir, map_location="cpu")
-
     device = next(model.parameters()).device
-    tail_kv = move_to_device(tail_kv, device)
-    local_past_seq_len = int(tail_kv[0][0].shape[-2]) if tail_kv else 0
-    model_past_key_values = _to_model_cache(tail_kv)
 
     suffix = "\n问题：" + question
     inputs = processor(text=[suffix], return_tensors="pt")
     inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
 
-    # attention_mask 覆盖 [past | question]
-    current_len = inputs["input_ids"].shape[1]
-    inputs["attention_mask"] = torch.ones(
-        (1, local_past_seq_len + current_len),
-        dtype=inputs["attention_mask"].dtype,
-        device=device,
-    )
-
-    # ---------------- ReKV Internal-style: 用 question 的 Q 向量做检索 ----------------
+    # ---------------- ReKV Internal-style: 仅输入 question，提取 Q 向量 ----------------
     # 1) 先做一次 forward，拿到每层 hidden_states（layer 输入）
     # 2) 对每层 hidden_states 通过 self_attn.q_proj 得到 Q
-    # 3) 用与解码一致的 position_ids 做 RoPE（关键）
+    # 3) 使用模型默认 question 位置（避免尾部窗口强偏置）
     # 4) 将 Q heads 聚合到 KV heads 维度，再跨层平均
-    # 绝对位置起点优先使用 manifest 里真实 full_merged_seq_len，避免 window 模式下位置回绕
-    absolute_start = int(full_merged_seq_len) if full_merged_seq_len is not None else local_past_seq_len
-    position_ids = torch.arange(absolute_start, absolute_start + current_len, device=device, dtype=torch.long).unsqueeze(0)
 
     with torch.no_grad():
         outputs = model(
             **inputs,
-            past_key_values=model_past_key_values,
             use_cache=False,
             output_hidden_states=True,
             return_dict=True,
-            position_ids=position_ids,
         )
 
     hidden_states = outputs.hidden_states
@@ -226,18 +203,18 @@ def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> to
         ).transpose(1, 2)
 
         # 为了与 K-summary 对齐，按 KV 头数聚合 query 头
-        # RoPE 需要和解码时位置一致：position_ids 从 past_seq_len 开始
+        # 使用 question-only 的位置编码，避免被视频末尾位置主导
         if hasattr(attn, "k_proj") and hasattr(attn, "rotary_emb"):
             k_dummy = attn.k_proj(layer_input).view(
                 layer_input.shape[0], layer_input.shape[1], attn.num_key_value_heads, attn.head_dim
             ).transpose(1, 2)
 
             # Qwen2Attention.rotary_emb 在不同版本 transformers 参数签名略有差异：
-            # 这里优先按 (x, position_ids) 调用；失败则退回不带 position_ids。
+            # 这里优先按 question-only 的默认位置调用。
             try:
-                cos, sin = attn.rotary_emb(k_dummy, position_ids)
-            except TypeError:
                 cos, sin = attn.rotary_emb(k_dummy)
+            except TypeError:
+                cos, sin = attn.rotary_emb(k_dummy, None)
 
             q_states, _ = apply_rotary_pos_emb(q_states, k_dummy, cos, sin)
 
@@ -245,7 +222,7 @@ def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> to
         q_means.append(q_grouped)
 
     query_layer_vecs = torch.stack(q_means, dim=0).cpu().float()  # [L, Hkv, D]
-    del outputs, hidden_states, tail_kv
+    del outputs, hidden_states
     return query_layer_vecs
 
 

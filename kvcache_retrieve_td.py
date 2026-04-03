@@ -284,6 +284,9 @@ def decode_kvcache(
 
         logits = outputs.logits[:, -1, :]
         if decode_strategy == "greedy":
+            if repetition_penalty > 1.0:
+                for tid in set(generated_token_ids):
+                    logits[:, tid] = logits[:, tid] / repetition_penalty
             next_token = torch.argmax(logits, dim=-1, keepdim=True)
         else:
             logits = logits / max(temperature, 1e-5)
@@ -291,6 +294,7 @@ def decode_kvcache(
             next_token = torch.multinomial(probs, num_samples=1)
         generated.append(next_token)
         generated_token_ids.append(int(next_token.item()))
+        repeat_streak = 1
 
         for step_idx in range(max_new_tokens - 1):
             step_attention_mask = torch.ones(
@@ -309,6 +313,9 @@ def decode_kvcache(
             logits = step_outputs.logits[:, -1, :]
 
             if decode_strategy == "greedy":
+                if repetition_penalty > 1.0:
+                    for tid in set(generated_token_ids):
+                        logits[:, tid] = logits[:, tid] / repetition_penalty
                 next_token = torch.argmax(logits, dim=-1, keepdim=True)
             else:
                 # repetition penalty: 降低已生成 token 再次被选中的概率。
@@ -333,9 +340,16 @@ def decode_kvcache(
                 next_token = torch.multinomial(probs, num_samples=1)
             generated.append(next_token)
             generated_token_ids.append(int(next_token.item()))
+            if len(generated_token_ids) >= 2 and generated_token_ids[-1] == generated_token_ids[-2]:
+                repeat_streak += 1
+            else:
+                repeat_streak = 1
 
             eos_id = getattr(model.generation_config, "eos_token_id", None)
             if eos_id is not None and int(next_token.item()) == int(eos_id) and (step_idx + 1) >= min_new_tokens:
+                break
+            # greedy 模式下，防止长时间重复同一 token 导致乱码死循环
+            if decode_strategy == "greedy" and repeat_streak >= 6 and (step_idx + 1) >= min_new_tokens:
                 break
 
     answer_ids = torch.cat(generated, dim=1)[0]

@@ -118,7 +118,7 @@ if __name__ == "__main__":
                 processor, 
                 model,
                 max_new_tokens=32,
-                min_new_tokens=32,
+                min_new_tokens=1,
                 temperature=0.0,
                 decode_strategy="greedy",
                 chunk_indices=decode_chunk_ids,
