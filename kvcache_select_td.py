@@ -161,82 +161,57 @@ def _load_tail_kv_as_past(kv_cache_dir: str, map_location="cpu"):
     return past_kv, full_merged_seq_len
 
 
-def _compute_query_vec(question: str, processor, model, kv_cache_dir: str) -> torch.Tensor:
+def _compute_query_vec(question: str, processor, model) -> torch.Tensor:
     """
-    ReKV internal 风格：仅输入 question 做 retrieval forward，
-    提取各层 question tokens 的 Q 向量，跨层跨 token 均值后返回。
+    用 hook 捕获 question tokens 的 pre-RoPE Q 向量。
 
-    为什么必须带 past context：
-      Qwen2 使用 RoPE，Q/K 向量都依赖 token 的绝对位置。
-      encode 时 video chunk i 的 K 向量处于位置 pos≈i*chunk_merged_len。
-      若 question standalone forward（past=None），其 Q 向量从 pos=0 开始，
-      与 video K 向量的位置差距极大，cosine similarity 由位置主导而非内容，
-      导致无论问什么问题相似度都单调递减。
-
-      若直接使用视频尾部 past context，检索会偏向最近窗口（top-k 常被最后几块占据）。
-      因此这里按 ReKV 实践仅输入 question 做检索向量，
-      再与各 chunk K 向量做逐层匹配，降低时间位置偏置。
+    为什么必须 pre-RoPE：
+      retrieval_index 里的 K 向量是 pre-RoPE（encode 阶段 hook 捕获）。
+      Q 也必须 pre-RoPE，两者才在同一纯内容语义空间。
+      post-RoPE Q 与 post-RoPE K（不同绝对位置）做 cosine sim，
+      结果由绝对位置差主导，与问题内容无关 → 单调性伪信号。
     """
     device = next(model.parameters()).device
 
     suffix = "\n问题：" + question
     inputs = processor(text=[suffix], return_tensors="pt")
-    inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
-    current_len = int(inputs["input_ids"].shape[1])
-    position_ids = torch.arange(current_len, device=device, dtype=torch.long).unsqueeze(0)
+    inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+              for k, v in inputs.items()}
 
-    # ---------------- ReKV Internal-style: 仅输入 question，提取 Q 向量 ----------------
-    # 1) 先做一次 forward，拿到每层 hidden_states（layer 输入）
-    # 2) 对每层 hidden_states 通过 self_attn.q_proj 得到 Q
-    # 3) 使用模型默认 question 位置（避免尾部窗口强偏置）
-    # 4) 将 Q heads 聚合到 KV heads 维度，再跨层平均
+    captured_q = []   # [Hkv, D] per layer
+    handles = []
 
-    with torch.no_grad():
-        outputs = model(
-            **inputs,
-            use_cache=False,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+    def _make_q_hook():
+        def _hook(module, args, kwargs):
+            hidden = args[0] if args else kwargs.get("hidden_states")
+            if hidden is not None:
+                with torch.no_grad():
+                    q = module.q_proj(hidden.float())
+                    B, T, _ = q.shape
+                    Hq  = module.num_heads
+                    Hkv = module.num_key_value_heads
+                    D   = module.head_dim
+                    q = q.view(B, T, Hq, D)
+                    # GQA fold: Hq → Hkv（与 encode 侧的 Hkv 对齐）
+                    if Hq != Hkv:
+                        g = Hq // Hkv
+                        q = q.view(B, T, Hkv, g, D).mean(dim=3)  # [B, T, Hkv, D]
+                    captured_q.append(q[0].mean(dim=0).detach().cpu())  # [Hkv, D]
+            return args, kwargs
+        return _hook
 
-    hidden_states = outputs.hidden_states
-    if hidden_states is None:
-        raise RuntimeError("Failed to get hidden_states for retrieval query vector computation.")
+    for layer in model.language_model.model.layers:
+        h = layer.self_attn.register_forward_pre_hook(_make_q_hook(), with_kwargs=True)
+        handles.append(h)
 
-    q_means = []
-    layers = model.language_model.model.layers
-    for layer_idx, layer in enumerate(layers):
-        layer_input = hidden_states[layer_idx]  # 第 layer_idx 层的输入
-        attn = layer.self_attn
+    try:
+        with torch.no_grad():
+            model(**inputs, use_cache=False, return_dict=True)
+    finally:
+        for h in handles:
+            h.remove()
 
-        # [B, Hq, T, D]
-        q_states = attn.q_proj(layer_input).view(
-            layer_input.shape[0], layer_input.shape[1], attn.num_heads, attn.head_dim
-        ).transpose(1, 2)
-
-        # 为了与 K-summary 对齐，按 KV 头数聚合 query 头
-        # 使用 question-only 的位置编码，避免被视频末尾位置主导
-        if hasattr(attn, "k_proj") and hasattr(attn, "rotary_emb"):
-            k_dummy = attn.k_proj(layer_input).view(
-                layer_input.shape[0], layer_input.shape[1], attn.num_key_value_heads, attn.head_dim
-            ).transpose(1, 2)
-
-            # Qwen2Attention.rotary_emb 在不同版本 transformers 参数签名略有差异：
-            # 对当前环境（Qwen2RotaryEmbedding）显式传入 position_ids。
-            try:
-                cos, sin = attn.rotary_emb(k_dummy, position_ids)
-            except TypeError:
-                # 兼容可能需要更多参数的位置编码实现，至少保证 position_ids 不为 None
-                cos, sin = attn.rotary_emb(k_dummy, position_ids=position_ids)
-
-            q_states, _ = apply_rotary_pos_emb(q_states, k_dummy, cos, sin)
-
-        q_grouped = _group_query_to_kv_heads(q_states, attn.num_key_value_heads)  # [Hkv, D]
-        q_means.append(q_grouped)
-
-    query_layer_vecs = torch.stack(q_means, dim=0).cpu().float()  # [L, Hkv, D]
-    del outputs, hidden_states
-    return query_layer_vecs
+    return torch.stack(captured_q, dim=0).float()   # [L, Hkv, D]
 
 
 # ---------------------------------------------------------------------------
@@ -249,64 +224,48 @@ def select_chunks(
     processor,
     model,
     top_k: int = 5,
-    always_include_first: bool = True,
+    always_include_first: bool = False,
 ) -> List[int]:
     """
-    Prompt-aware chunk 选择，返回与 question 最相关的 top_k 个 chunk_index。
+    Prompt-aware chunk 选择，返回连续的 chunk 范围（保证 RoPE 位置一致性）。
 
-    Parameters
-    ----------
-    kv_cache_dir : str
-        encode 产生的 chunk 目录。
-    question : str
-        用户问题。
-    processor / model :
-        已加载的 LlavaOnevision processor 和 model。
-    top_k : int
-        返回相似度最高的 k 个 chunk（不含强制包含的第一块）。
-    always_include_first : bool
-        是否强制包含 chunk 0。
-        chunk 0 含 ENCODE_PREFIX + 完整视觉语境，是整个视频理解的语义锚点，
-        建议始终保留。默认 True。
+    返回 [min_selected, max_selected] 范围内的所有连续 chunk，
+    而非离散索引，避免非连续 KV 拼接导致的 RoPE 旋转角度错误。
 
-    Returns
-    -------
-    List[int]  按 chunk_index 升序排列（保留视频时序）。
+    always_include_first 默认 False：
+      chunk 0 与末尾 chunk 混合会造成位置不一致（差距达数万 token）。
+      若需包含 chunk 0，设为 True 并接受从 0 加载到 max_selected 的所有 chunk。
     """
-    # 1. 加载每个 chunk 的逐层 K 向量均值
-    all_indices, chunk_layer_key_vecs = _load_chunk_layer_key_vecs(kv_cache_dir)   # [N, L, Hkv, D]
+    all_indices, chunk_layer_key_vecs = _load_chunk_layer_key_vecs(kv_cache_dir)
     n_chunks = len(all_indices)
 
     if top_k >= n_chunks:
         print(f"[select_chunks] top_k={top_k} >= total chunks={n_chunks}, returning all.")
         return all_indices
 
-    # 2. 计算 question 的逐层 Q 向量（以视频末尾位置作为绝对坐标）
-    query_layer_vecs = _compute_query_vec(question, processor, model, kv_cache_dir)  # [L, Hkv, D]
+    query_layer_vecs = _compute_query_vec(question, processor, model)
 
-    # 3. ReKV-style per-layer QK 相似度：
-    #    逐层 cosine 后取平均，减少“跨层平均后被位置主导”的现象。
-    q = query_layer_vecs.reshape(query_layer_vecs.shape[0], -1)                # [L, D']
-    c = chunk_layer_key_vecs.reshape(chunk_layer_key_vecs.shape[0], q.shape[0], -1)  # [N, L, D']
-    # 轻量去中心化：减去 chunk 集合均值，降低单调时间位置偏置
-    c_center = c - c.mean(dim=0, keepdim=True)
-    q_center = q - c.mean(dim=0)
-    q_norm = F.normalize(q_center, dim=1)                     # [L, D']
-    c_norm = F.normalize(c_center, dim=2)                     # [N, L, D']
-    sim = (c_norm * q_norm.unsqueeze(0)).sum(dim=2).mean(dim=1)  # [N]
+    # pre-RoPE Q · pre-RoPE K = 纯内容相关性，无需 mean-centering
+    q = query_layer_vecs.reshape(query_layer_vecs.shape[0], -1)
+    c = chunk_layer_key_vecs.reshape(chunk_layer_key_vecs.shape[0], q.shape[0], -1)
+    q_norm = F.normalize(q, dim=1)
+    c_norm = F.normalize(c, dim=2)
+    sim = (c_norm * q_norm.unsqueeze(0)).sum(dim=2).mean(dim=1)
 
-    print("[select_chunks] Cosine similarities:")
+    print("[select_chunks] Cosine similarities (pre-RoPE, content-based):")
     for idx, s in zip(all_indices, sim.tolist()):
         print(f"  chunk {idx:3d}: {s:.4f}")
 
-    # 4. 选 top_k（从 summary_vecs 中排序）
     topk_local = torch.topk(sim, k=min(top_k, n_chunks), largest=True).indices.tolist()
-    selected = set(all_indices[i] for i in topk_local)
+    selected_set = {all_indices[i] for i in topk_local}
 
-    # 5. 强制包含 chunk 0
     if always_include_first and 0 in all_indices:
-        selected.add(0)
+        selected_set.add(0)
 
-    result = sorted(selected)
-    print(f"[select_chunks] Selected chunks: {result} (top_k={top_k}, always_first={always_include_first})")
+    min_idx = min(selected_set)
+    max_idx = max(selected_set)
+    result = [idx for idx in all_indices if min_idx <= idx <= max_idx]
+
+    print(f"[select_chunks] top-{top_k} hits: {sorted(selected_set)}")
+    print(f"[select_chunks] Contiguous range [{min_idx}, {max_idx}]: {result}")
     return result

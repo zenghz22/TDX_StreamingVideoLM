@@ -274,6 +274,36 @@ def encode_video(
                 if isinstance(v, torch.Tensor):
                     print(f"[chunk {i}] model_inputs[{k}] shape: {tuple(v.shape)}")
 
+            # ----------------------------------------------------------------
+            # 捕获 pre-RoPE K 向量（用于 retrieval_index，内容相关性检索）
+            # 注意：delta_kv 里的 K 是 post-RoPE（绝对位置已烘入），
+            # 不同 chunk 的绝对位置差距数万，cosine sim 会被位置主导。
+            # 用 hook 在 k_proj 输出后、apply_rotary_pos_emb 之前捕获，
+            # 得到纯内容相关的 K 向量，可与 select 侧的 pre-RoPE Q 比较。
+            # ----------------------------------------------------------------
+            _pre_rope_k_layers = []   # [Hkv, D] per layer
+            _hook_handles_k = []
+
+            def _make_k_capture():
+                def _hook(module, args, kwargs):
+                    hidden = args[0] if args else kwargs.get("hidden_states")
+                    if hidden is not None:
+                        with torch.no_grad():
+                            k = module.k_proj(hidden.float())
+                            B, T, _ = k.shape
+                            Hkv = module.num_key_value_heads
+                            D   = module.head_dim
+                            k = k.view(B, T, Hkv, D)
+                            _pre_rope_k_layers.append(k[0].mean(dim=0).detach().cpu())
+                    return args, kwargs
+                return _hook
+
+            for _layer in model.language_model.model.layers:
+                _h = _layer.self_attn.register_forward_pre_hook(
+                    _make_k_capture(), with_kwargs=True
+                )
+                _hook_handles_k.append(_h)
+
             with torch.no_grad():
                 outputs = model(
                     **model_inputs,
@@ -281,6 +311,10 @@ def encode_video(
                     use_cache=True,
                     return_dict=True,
                 )
+
+            for _h in _hook_handles_k:
+                _h.remove()
+            _hook_handles_k.clear()
 
             # position hook 用完立即关闭（避免影响后续操作）
             if use_manager:
@@ -305,16 +339,18 @@ def encode_video(
                 )
                 delta_seq_len = int(delta_kv[0][0].shape[-2])
 
-                # ---- chunk summary vector（供 kvcache_select_td 检索使用）----
-                # 使用 K 向量（ReKV ICLR'25 Eq.2）：
-                # mean(K_tokens) per layer → mean across layers → flatten
-                k_means = []
-                for layer_k, _ in delta_kv:
-                    # layer_k: [batch, num_kv_heads, seq, head_dim]
-                    k_means.append(layer_k[0].mean(dim=1))  # [num_kv_heads, head_dim]
-                chunk_layer_key_vec = torch.stack(k_means, dim=0).float()   # [L, Hkv, D]
-                chunk_summary_vec = chunk_layer_key_vec.mean(dim=0).flatten()
-                chunk_summary_vec = chunk_summary_vec.float()
+                # ---- chunk summary vector（pre-RoPE K，供 select 检索）----
+                if _pre_rope_k_layers:
+                    chunk_layer_key_vec = torch.stack(_pre_rope_k_layers, dim=0).float()  # [L, Hkv, D]
+                else:
+                    # fallback: post-RoPE K mean（hook 未捕获时退化）
+                    k_means = []
+                    for layer_k, _ in delta_kv:
+                        k_means.append(layer_k[0].mean(dim=1).float())
+                    chunk_layer_key_vec = torch.stack(k_means, dim=0).float()
+                _pre_rope_k_layers.clear()
+
+                chunk_summary_vec = chunk_layer_key_vec.mean(dim=0).flatten().float()
 
                 print(f"[chunk {i}] full_kv_seq_len: {full_kv_seq_len}")
                 print(f"[chunk {i}] delta_seq_len (this chunk merged): {delta_seq_len}")
@@ -384,7 +420,7 @@ def encode_video(
                         "past_seq_len": shard_metadata.get("past_seq_len"),
                         "layer0_key_shape": shard_metadata.get("layer0_key_shape"),
                         # ReKV-style summary vector：跨层 K 均值，用于 prompt-aware 检索
-                        "summary_vec": chunk_summary_vec.tolist() if chunk_summary_vec is not None else None,
+                        #"summary_vec": chunk_summary_vec.tolist() if chunk_summary_vec is not None else None,
                     }
                 )
                 retrieval_chunk_indices.append(i)

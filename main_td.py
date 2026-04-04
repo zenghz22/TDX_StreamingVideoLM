@@ -51,7 +51,7 @@ if __name__ == "__main__":
     #question      = "Who is the green toy character appearing in the video?"
     #question      = "How many eggs are there in the video?"
     #question      = "What is the tool used to extract the yolk from the egg?"
-    question      = "What is the material of the spoon at the end of the video?"
+    question      = "What is the material of the spoon at the beginning of the video?"
 
     parser = argparse.ArgumentParser(description="TD-side video encoding and decoding")
     parser.add_argument("--mode", type=str, default="encode_decode",choices=["encode_decode","decode","encode"])

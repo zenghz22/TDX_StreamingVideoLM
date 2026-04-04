@@ -58,8 +58,20 @@ def _resolve_chunk_files_from_dir(kv_cache_dir, chunk_index=None, chunk_indices=
         missing = [i for i in chunk_indices if i not in idx_map]
         if missing:
             raise ValueError(f"chunk_indices {missing} not found in manifest: {manifest_path}")
-        selected_chunks = sorted([idx_map[i] for i in chunk_indices], key=lambda c: int(c["chunk_index"]))
+
+        # RoPE 位置一致性保证：每个 chunk 的 K/V 向量在 encode 时绑定了其绝对位置。
+        # 若直接拼接非连续的 chunk（如 [0, 38, 39]），chunk 38 的 K 向量仍编码
+        # 位置 ~109364，但拼接后模型看到的相对位置是 ~551，两者相差 10 万+，
+        # RoPE 旋转角度完全错误，导致 attention 崩溃，产生乱码输出。
+        # 解决方案：始终加载连续范围 [min_idx, max_idx] 的全部 chunk。
+        min_idx = min(chunk_indices)
+        max_idx = max(chunk_indices)
+        selected_chunks = [c for c in chunks_sorted
+                           if min_idx <= int(c["chunk_index"]) <= max_idx]
         selected = selected_chunks[-1]
+        print(f"[load_kv_cache] chunk_indices {sorted(chunk_indices)} → "
+              f"expanded to contiguous range [{min_idx}, {max_idx}] "
+              f"({len(selected_chunks)} chunks) for RoPE consistency.")
     else:
         if chunk_index is None:
             selected = chunks_sorted[-1]
@@ -220,6 +232,7 @@ def decode_kvcache(
     top_p=0.9,
     repetition_penalty=1.1,
     decode_strategy="sample",
+    suffix=None,
 ):
     """加载 KV cache，直接文本解码，跳过视频预处理与编码。
 
@@ -231,6 +244,9 @@ def decode_kvcache(
         生成策略：
           - "sample": 采样（temperature/top_p/repetition_penalty 生效）
           - "greedy": 贪心（忽略 top_p，temperature/repetition_penalty 不生效）
+    suffix : str | None
+        若提供，直接作为 decode 的文本输入，绕过 _build_decode_suffix。
+        适合需要包含选项、格式化 prompt 的场景（如多选题评测）。
     """
     kv_cache, metadata = load_kv_cache(
         kv_cache_path, map_location="cpu",
@@ -248,7 +264,7 @@ def decode_kvcache(
     kv_cache = move_to_device(kv_cache, device)
     model_past_key_values = _to_model_cache(kv_cache)
 
-    suffix = _build_decode_suffix(question)
+    suffix = suffix if suffix is not None else _build_decode_suffix(question)
     model_inputs = processor(text=[suffix], return_tensors="pt")
     model_inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in model_inputs.items()}
 
@@ -284,9 +300,6 @@ def decode_kvcache(
 
         logits = outputs.logits[:, -1, :]
         if decode_strategy == "greedy":
-            if repetition_penalty > 1.0:
-                for tid in set(generated_token_ids):
-                    logits[:, tid] = logits[:, tid] / repetition_penalty
             next_token = torch.argmax(logits, dim=-1, keepdim=True)
         else:
             logits = logits / max(temperature, 1e-5)
@@ -294,7 +307,6 @@ def decode_kvcache(
             next_token = torch.multinomial(probs, num_samples=1)
         generated.append(next_token)
         generated_token_ids.append(int(next_token.item()))
-        repeat_streak = 1
 
         for step_idx in range(max_new_tokens - 1):
             step_attention_mask = torch.ones(
@@ -313,9 +325,6 @@ def decode_kvcache(
             logits = step_outputs.logits[:, -1, :]
 
             if decode_strategy == "greedy":
-                if repetition_penalty > 1.0:
-                    for tid in set(generated_token_ids):
-                        logits[:, tid] = logits[:, tid] / repetition_penalty
                 next_token = torch.argmax(logits, dim=-1, keepdim=True)
             else:
                 # repetition penalty: 降低已生成 token 再次被选中的概率。
@@ -340,16 +349,9 @@ def decode_kvcache(
                 next_token = torch.multinomial(probs, num_samples=1)
             generated.append(next_token)
             generated_token_ids.append(int(next_token.item()))
-            if len(generated_token_ids) >= 2 and generated_token_ids[-1] == generated_token_ids[-2]:
-                repeat_streak += 1
-            else:
-                repeat_streak = 1
 
             eos_id = getattr(model.generation_config, "eos_token_id", None)
             if eos_id is not None and int(next_token.item()) == int(eos_id) and (step_idx + 1) >= min_new_tokens:
-                break
-            # greedy 模式下，防止长时间重复同一 token 导致乱码死循环
-            if decode_strategy == "greedy" and repeat_streak >= 6 and (step_idx + 1) >= min_new_tokens:
                 break
 
     answer_ids = torch.cat(generated, dim=1)[0]

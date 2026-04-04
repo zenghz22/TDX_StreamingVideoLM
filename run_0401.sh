@@ -23,7 +23,7 @@ run_encode_decode(){
     HF_ENDPOINT='https://hf-mirror.com' python main_td.py --mode "encode_decode" --encode_memory $encode_memory --encode_window $encode_window --decode_indices $decode_indices --decode_select $decode_select --plot_file "../data/plots/${name}.png"   > ../data/logs/${name}.log 2>&1
 }
 
-run_encode 16 4
+#run_encode 16 4
 run_decode "full" 0
 run_decode "full" 2
 run_decode "full" 4
