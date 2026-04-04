@@ -91,7 +91,7 @@ if __name__ == "__main__":
 
             if args.decode_select > 0:
                 top_k = args.decode_select
-                decode_chunk_ids = select_chunks(kv_cache_path, question, processor, model, top_k=top_k, always_include_first=True)
+                decode_chunk_ids = select_chunks(kv_cache_path, question, processor, model, top_k=top_k, always_include_first=False)
                 logger.info(f"Decoding with top-{top_k} selected chunks based on question relevance.")
             elif args.decode_select == 0:
                 decode_chunk_ids = None  # None 表示加载全部 chunk
@@ -135,7 +135,7 @@ if __name__ == "__main__":
                 "is_correct": is_correct
             }
             with open("../data/mlvu_results.csv", "a", newline='') as csvfile:
-                fieldnames = ["anon_index", "video_id", "question", "choices", "model_answer", "correct_answer","decode_chunk_indices", "is_correct" ]
+                fieldnames = ["anon_index", "video_id", "question", "choices", "model_answer", "correct_letter","decode_chunk_indices", "is_correct" ]
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 if csvfile.tell() == 0:  # 如果文件是空的，写入表头
                     writer.writeheader()

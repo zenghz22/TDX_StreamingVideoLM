@@ -8,4 +8,4 @@ run_encode_decode(){
     HF_ENDPOINT='https://hf-mirror.com' python eval_mlvu.py --mode "encode_decode" --encode_memory $encode_memory --encode_window $encode_window --decode_select $decode_select --plot_file "../data/plots/${name}.png"   >> ../data/logs/${name}.log 2>&1
 }
 
-run_encode_decode 256 8 "select8" 0
+run_encode_decode 256 8 8 0

@@ -224,48 +224,75 @@ def select_chunks(
     processor,
     model,
     top_k: int = 5,
-    always_include_first: bool = False,
+    always_include_first: bool = True,
 ) -> List[int]:
     """
-    Prompt-aware chunk 选择，返回连续的 chunk 范围（保证 RoPE 位置一致性）。
+    Prompt-aware chunk 选择，返回 similarity 总和最大的连续 top_k 个 chunk。
 
-    返回 [min_selected, max_selected] 范围内的所有连续 chunk，
-    而非离散索引，避免非连续 KV 拼接导致的 RoPE 旋转角度错误。
+    Parameters
+    ----------
+    kv_cache_dir : str
+        encode 产生的 chunk 目录。
+    question : str
+        用户问题。
+    processor / model :
+        已加载的 LlavaOnevision processor 和 model。
+    top_k : int
+        返回连续窗口长度为 k 的 chunk 区间。
+    always_include_first : bool
+        是否强制包含 chunk 0。
+        chunk 0 含 ENCODE_PREFIX + 完整视觉语境，是整个视频理解的语义锚点，
+        建议始终保留。默认 True。
 
-    always_include_first 默认 False：
-      chunk 0 与末尾 chunk 混合会造成位置不一致（差距达数万 token）。
-      若需包含 chunk 0，设为 True 并接受从 0 加载到 max_selected 的所有 chunk。
+    Returns
+    -------
+    List[int]  连续 chunk 区间（按 chunk_index 升序）。
     """
-    all_indices, chunk_layer_key_vecs = _load_chunk_layer_key_vecs(kv_cache_dir)
+    # 1. 加载每个 chunk 的逐层 K 向量均值
+    all_indices, chunk_layer_key_vecs = _load_chunk_layer_key_vecs(kv_cache_dir)   # [N, L, Hkv, D]
     n_chunks = len(all_indices)
 
     if top_k >= n_chunks:
         print(f"[select_chunks] top_k={top_k} >= total chunks={n_chunks}, returning all.")
         return all_indices
 
-    query_layer_vecs = _compute_query_vec(question, processor, model)
+    # 2. 计算 question 的逐层 Q 向量（以视频末尾位置作为绝对坐标）
+    query_layer_vecs = _compute_query_vec(question, processor, model)  # [L, Hkv, D]
 
-    # pre-RoPE Q · pre-RoPE K = 纯内容相关性，无需 mean-centering
-    q = query_layer_vecs.reshape(query_layer_vecs.shape[0], -1)
-    c = chunk_layer_key_vecs.reshape(chunk_layer_key_vecs.shape[0], q.shape[0], -1)
+    # 3. ReKV-style per-layer QK 相似度：
+    #    逐层 cosine 后取平均，减少“跨层平均后被位置主导”的现象。
+    q = query_layer_vecs.reshape(query_layer_vecs.shape[0], -1)                # [L, D']
+    c = chunk_layer_key_vecs.reshape(chunk_layer_key_vecs.shape[0], q.shape[0], -1)  # [N, L, D']
+
     q_norm = F.normalize(q, dim=1)
     c_norm = F.normalize(c, dim=2)
     sim = (c_norm * q_norm.unsqueeze(0)).sum(dim=2).mean(dim=1)
 
     print("[select_chunks] Cosine similarities (pre-RoPE, content-based):")
-    for idx, s in zip(all_indices, sim.tolist()):
-        print(f"  chunk {idx:3d}: {s:.4f}")
+    #for idx, s in zip(all_indices, sim.tolist()):
+    #    print(f"  chunk {idx:3d}: {s:.4f}")
+    # 每10个一行打印，用空格分隔，方便观察局部连续性
+    for i in range(0, n_chunks, 10):
+        line = " ".join(f"{idx:3d}:{s:.4f}" for idx, s in zip(all_indices[i:i+10], sim[i:i+10].tolist()))
+        print(f"  {line}")
 
-    topk_local = torch.topk(sim, k=min(top_k, n_chunks), largest=True).indices.tolist()
-    selected_set = {all_indices[i] for i in topk_local}
 
-    if always_include_first and 0 in all_indices:
-        selected_set.add(0)
+    # 4. 选“连续 top_k”窗口：遍历所有长度为 top_k 的区间，取相似度和最大的窗口
+    window = min(top_k, n_chunks)
+    prefix = torch.cat([torch.zeros(1, dtype=sim.dtype), torch.cumsum(sim, dim=0)], dim=0)
 
-    min_idx = min(selected_set)
-    max_idx = max(selected_set)
-    result = [idx for idx in all_indices if min_idx <= idx <= max_idx]
+    best_start = 0
+    best_score = float("-inf")
+    for start in range(0, n_chunks - window + 1):
+        score = float((prefix[start + window] - prefix[start]).item())
+        if score > best_score:
+            best_score = score
+            best_start = start
+    
 
-    print(f"[select_chunks] top-{top_k} hits: {sorted(selected_set)}")
-    print(f"[select_chunks] Contiguous range [{min_idx}, {max_idx}]: {result}")
+    result = all_indices[best_start: best_start + window]
+    print(
+        f"[select_chunks] Selected contiguous window: start={result[0]}, end={result[-1]}, "
+        f"top_k={window}, score_sum={best_score:.4f}, always_first={always_include_first}"
+    )
     return result
