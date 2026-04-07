@@ -58,20 +58,11 @@ def _resolve_chunk_files_from_dir(kv_cache_dir, chunk_index=None, chunk_indices=
         missing = [i for i in chunk_indices if i not in idx_map]
         if missing:
             raise ValueError(f"chunk_indices {missing} not found in manifest: {manifest_path}")
-
-        # RoPE 位置一致性保证：每个 chunk 的 K/V 向量在 encode 时绑定了其绝对位置。
-        # 若直接拼接非连续的 chunk（如 [0, 38, 39]），chunk 38 的 K 向量仍编码
-        # 位置 ~109364，但拼接后模型看到的相对位置是 ~551，两者相差 10 万+，
-        # RoPE 旋转角度完全错误，导致 attention 崩溃，产生乱码输出。
-        # 解决方案：始终加载连续范围 [min_idx, max_idx] 的全部 chunk。
-        min_idx = min(chunk_indices)
-        max_idx = max(chunk_indices)
-        selected_chunks = [c for c in chunks_sorted
-                           if min_idx <= int(c["chunk_index"]) <= max_idx]
+        selected_chunks = [idx_map[i] for i in chunk_indices]
         selected = selected_chunks[-1]
-        print(f"[load_kv_cache] chunk_indices {sorted(chunk_indices)} → "
-              f"expanded to contiguous range [{min_idx}, {max_idx}] "
-              f"({len(selected_chunks)} chunks) for RoPE consistency.")
+        selected_chunk_index = int(selected["chunk_index"])
+        print(f"Selected chunk_indices={chunk_indices} → loading {len(selected_chunks)} chunks up to index {selected_chunk_index}")
+
     else:
         if chunk_index is None:
             selected = chunks_sorted[-1]
@@ -162,6 +153,11 @@ def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_ind
         metadata["loaded_from_dir"] = kv_cache_path
         loaded_indices = [int(c["chunk_index"]) for c in selected_chunks]
         resolved_path = f"{kv_cache_path} (chunks {loaded_indices})"
+        # 从 manifest 的 common_metadata 提取真实的完整 merged 序列长度
+        if manifest:
+            common_meta = manifest.get("common_metadata", {}) or {}
+            if "full_merged_seq_len" in common_meta:
+                metadata["full_merged_seq_len"] = int(common_meta["full_merged_seq_len"])
         print(f"Loaded KV cache from {resolved_path}")
         if metadata:
             print(f"KV metadata: {metadata}")
@@ -191,6 +187,20 @@ def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_ind
     if metadata:
         print(f"KV metadata: {metadata}")
     return kv_cache, metadata
+
+
+def _load_prefix_cache(kv_cache_dir: str, map_location: str = "cpu"):
+    """
+    加载 prefix_cache.safetensors（encode_prefix 文字 token 的 KV）。
+    若文件不存在返回 (None, 0)，兼容旧数据。
+    """
+    prefix_path = os.path.join(kv_cache_dir, "prefix_cache.safetensors")
+    if not os.path.exists(prefix_path):
+        return None, 0
+    prefix_kv, meta = _load_single_safetensors_kv(prefix_path, map_location=map_location)
+    prefix_seq_len = int(prefix_kv[0][0].shape[-2]) if prefix_kv else 0
+    print(f"[load_prefix_cache] Loaded prefix KV: {prefix_seq_len} tokens from {prefix_path}")
+    return prefix_kv, prefix_seq_len
 
 
 def _build_decode_suffix(question):
@@ -261,6 +271,22 @@ def decode_kvcache(
         raise ValueError(f"Model mismatch: cache={expected_model}, current={model_name}")
 
     device = next(model.parameters()).device
+
+    # ---- 始终加载轻量的 prefix_cache，拼在 chunk KV 之前 ----
+    # prefix_cache 存的是 encode_prefix 文字 token 的 KV（位置 0..P-1）。
+    # chunk shard 存的是视频 visual token 的 delta KV（位置 P+... ）。
+    # 两者拼接后，各段 K/V 向量保留其 encode 时的绝对位置，RoPE 正确。
+    if os.path.isdir(kv_cache_path):
+        prefix_kv, prefix_seq_len = _load_prefix_cache(kv_cache_path, map_location="cpu")
+        if prefix_kv is not None and kv_cache:
+            prefix_kv_dev = tuple((k.to(device), v.to(device)) for k, v in prefix_kv)
+            kv_cache = _concat_kv_segments([prefix_kv_dev, kv_cache])
+            print(f"[decode] Prepended prefix ({prefix_seq_len} tokens) → total KV seq_len={kv_cache[0][0].shape[-2]}")
+        elif prefix_kv is not None:
+            kv_cache = tuple((k.to(device), v.to(device)) for k, v in prefix_kv)
+    else:
+        prefix_seq_len = 0
+
     kv_cache = move_to_device(kv_cache, device)
     model_past_key_values = _to_model_cache(kv_cache)
 
@@ -276,6 +302,23 @@ def decode_kvcache(
         device=device,
     )
     model_inputs["attention_mask"] = full_attention_mask
+
+    # ---- position_ids 修正 ----
+    # past_seq_len = 实际加载的 KV 长度（prefix + 选定窗口）
+    # full_merged_seq_len = encode 时所有 chunk 的完整 merged 总长
+    # question 的 Q 向量必须使用 full_merged_seq_len 作为起始绝对位置，
+    # 才能与各 chunk K 向量的真实绝对位置保持正确的 RoPE 相对距离。
+    full_merged_seq_len = int(metadata.get("full_merged_seq_len", past_seq_len))
+    if full_merged_seq_len > past_seq_len:
+        position_ids = torch.arange(
+            full_merged_seq_len,
+            full_merged_seq_len + current_seq_len,
+            device=device,
+            dtype=torch.long,
+        ).unsqueeze(0)
+        model_inputs["position_ids"] = position_ids
+        print(f"[decode] position_ids corrected: start={full_merged_seq_len} "
+              f"(loaded_kv={past_seq_len}, full={full_merged_seq_len})")
 
     for k, v in model_inputs.items():
         if isinstance(v, torch.Tensor):
@@ -308,19 +351,33 @@ def decode_kvcache(
         generated.append(next_token)
         generated_token_ids.append(int(next_token.item()))
 
+        # 追踪下一个生成 token 的正确绝对位置。
+        # prefill 之后，下一个 token 应在 full_merged_seq_len + current_seq_len 处。
+        # 每步 +1。需要 position_ids 修正的条件：full_merged_seq_len > past_seq_len
+        # （即加载了非完整 KV 子集）。
+        need_pos_correction = full_merged_seq_len > past_seq_len
+        next_token_pos = full_merged_seq_len + current_seq_len  # 第一个生成 token 的位置
+
         for step_idx in range(max_new_tokens - 1):
             step_attention_mask = torch.ones(
                 (1, past_seq_len + current_seq_len + len(generated)),
                 dtype=model_inputs["attention_mask"].dtype,
                 device=device,
             )
-            step_outputs = model(
+            step_kwargs = dict(
                 input_ids=next_token,
                 attention_mask=step_attention_mask,
                 past_key_values=past,
                 use_cache=True,
                 return_dict=True,
             )
+            if need_pos_correction:
+                step_kwargs["position_ids"] = torch.tensor(
+                    [[next_token_pos]], dtype=torch.long, device=device
+                )
+            step_outputs = model(**step_kwargs)
+            next_token_pos += 1
+
             past = step_outputs.past_key_values
             logits = step_outputs.logits[:, -1, :]
 

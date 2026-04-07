@@ -13,7 +13,6 @@ from transformers import LlavaOnevisionForConditionalGeneration as LlavaOV
 from transformers import LlavaOnevisionProcessor
 
 # 统一前缀：编码和解码都基于同一语境，避免 KV 与后续文本提示错位。
-ENCODE_PREFIX = "请先理解视频内容，并记住关键事件与人物。"
 VIDEO_PLACEHOLDER = "<video>"
 
 
@@ -153,6 +152,53 @@ def _write_retrieval_index(kv_cache_dir, chunk_indices, layer_key_vecs, summary_
 
 
 # ---------------------------------------------------------------------------
+# 前缀编码与保存（prefix_cache.safetensors）
+# ---------------------------------------------------------------------------
+
+def _encode_and_save_prefix(encode_prefix, processor, model, kv_cache_dir, device):
+    """
+    单独 forward encode_prefix 文字（无视频），将 prefix KV 存为
+    prefix_cache.safetensors。
+
+    好处：
+    - 各 chunk shard 只含视频 visual token 的 delta KV（不含前缀文字 token）
+    - decode 时始终加载轻量 prefix_cache，再拼接连续窗口
+    - 彻底解除"chunk 0 必须被选"的约束，避免非连续 chunk 的 RoPE 位置错乱
+    """
+    if not encode_prefix or not encode_prefix.strip():
+        return None, 0
+
+    text = encode_prefix.strip()
+    inputs = processor(text=[text], return_tensors="pt")
+    inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+              for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model(**inputs, past_key_values=None, use_cache=True, return_dict=True)
+
+    prefix_kv = tuple(
+        (layer_kv[0].detach().cpu().contiguous(),
+         layer_kv[1].detach().cpu().contiguous())
+        for layer_kv in outputs.past_key_values
+    )
+    prefix_seq_len = int(prefix_kv[0][0].shape[-2])
+    del outputs
+    gc.collect()
+
+    print(f"[encode_prefix] Encoded {prefix_seq_len} prefix text tokens.")
+
+    if kv_cache_dir is not None:
+        prefix_path = os.path.join(kv_cache_dir, "prefix_cache.safetensors")
+        save_kv_cache(prefix_kv, prefix_path, model=model,
+                      extra_metadata={"is_prefix": True,
+                                      "prefix_seq_len": prefix_seq_len,
+                                      "prefix_text": text})
+        print(f"[encode_prefix] Saved to {prefix_path}")
+
+    return prefix_kv, prefix_seq_len
+
+
+# ---------------------------------------------------------------------------
 # encode_video — 支持 KVCacheManager（可选）
 # ---------------------------------------------------------------------------
 
@@ -161,7 +207,7 @@ def encode_video(
     processor,
     model=None,
     chunk_size=64,
-    encode_prefix=ENCODE_PREFIX,
+    encode_prefix=None,
     stage_mark=None,
     kv_cache_dir=None,
     manager=None,           # 可选：KVCacheManager 实例
@@ -210,6 +256,20 @@ def encode_video(
     if kv_cache_dir is not None:
         os.makedirs(kv_cache_dir, exist_ok=True)
 
+    # ---- 前缀单独编码 ----
+    # encode_prefix 文字 token 的 KV 存为 prefix_cache.safetensors；
+    # 各 chunk shard 只存视频 visual token 的 delta KV。
+    prefix_kv = None
+    prefix_seq_len = 0
+    if model is not None:
+        device_tmp = next(model.parameters()).device
+        prefix_kv, prefix_seq_len = _encode_and_save_prefix(
+            encode_prefix, processor, model, kv_cache_dir, device_tmp
+        )
+        # manager 的 _full_merged_seq_len 从 prefix_seq_len 开始累积
+        if use_manager and prefix_seq_len > 0:
+            manager._full_merged_seq_len = prefix_seq_len
+
     try:
         for i in range(num_chunks):
             chunk = video[i * chunk_size : min((i + 1) * chunk_size, num_frames)]
@@ -223,10 +283,9 @@ def encode_video(
                 kv_cache.append({"chunk_index": i, "pixel_values_shape": tuple(pixel_values.shape)})
                 continue
 
-            if i == 0:
-                encode_text = _build_encode_text(encode_prefix)
-            else:
-                encode_text = VIDEO_PLACEHOLDER
+            # 所有 chunk 都只用 VIDEO_PLACEHOLDER；
+            # encode_prefix 已单独 forward 并存为 prefix_cache.safetensors。
+            encode_text = VIDEO_PLACEHOLDER
 
             model_inputs = processor(
                 text=[encode_text],
@@ -242,12 +301,24 @@ def encode_video(
 
             # ----------------------------------------------------------------
             # 决定传给 model 的 past_key_values 及 attention_mask
+            # 所有模式均将 prefix_kv 拼在窗口/全量 KV 之前。
             # ----------------------------------------------------------------
+            from kvcache_retrieve_td import _concat_kv_segments as _cat_kv
+            def _prepend_prefix(base_kv, base_seq_len):
+                """将 prefix_kv 拼到 base_kv 前面，返回 (merged_kv, merged_seq_len)。"""
+                if prefix_kv is None:
+                    return (base_kv, base_seq_len)
+                if base_kv is None:
+                    pkv = tuple((k.to(device), v.to(device)) for k, v in prefix_kv)
+                    return (pkv, prefix_seq_len)
+                pkv = tuple((k.to(device), v.to(device)) for k, v in prefix_kv)
+                merged = _cat_kv([pkv, base_kv])
+                return (merged, int(merged[0][0].shape[-2]))
+
             if use_manager:
-                # manager 模式：获取窗口（或全量）历史 KV
-                past_kv, past_kv_seq_len = manager.get_past_kv_for_forward(i)
-                # attention_mask 覆盖 [past_kv | current_text_tokens]
-                # 注意：current text len 是 input_ids 的长度（视觉 token 展开在 model 内部完成）
+                # manager 模式：获取窗口（或全量）历史 KV，再拼 prefix
+                window_kv, window_seq_len = manager.get_past_kv_for_forward(i)
+                past_kv, past_kv_seq_len = _prepend_prefix(window_kv, window_seq_len)
                 current_text_len = model_inputs["input_ids"].shape[1]
                 if past_kv_seq_len > 0:
                     model_inputs["attention_mask"] = torch.ones(
@@ -256,9 +327,10 @@ def encode_video(
                         device=device,
                     )
             else:
-                # 原有模式：全量累积 KV
-                past_kv = kv_cache if kv_cache else None
-                past_kv_seq_len = _get_cache_seq_len(kv_cache)
+                # 原有模式：全量累积 KV + prefix
+                base_kv = kv_cache if kv_cache else None
+                base_seq = _get_cache_seq_len(kv_cache)
+                past_kv, past_kv_seq_len = _prepend_prefix(base_kv, base_seq)
                 current_text_len = model_inputs["input_ids"].shape[1]
                 if past_kv_seq_len > 0:
                     model_inputs["attention_mask"] = torch.ones(

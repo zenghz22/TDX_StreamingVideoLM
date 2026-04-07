@@ -380,7 +380,7 @@ def encode_video_managed(
     window_size : int | None
         滑动窗口大小；None = 全局注意力 + LRU。
     """
-    from kvcache_generate_td import encode_video, ENCODE_PREFIX
+    from kvcache_generate_td import encode_video
 
     manager = KVCacheManager(
         kv_cache_dir=kv_cache_dir,
@@ -394,7 +394,7 @@ def encode_video_managed(
         processor=processor,
         model=model,
         chunk_size=chunk_size,
-        encode_prefix=encode_prefix or ENCODE_PREFIX,
+        encode_prefix=encode_prefix,
         stage_mark=stage_mark,
         kv_cache_dir=kv_cache_dir,
         manager=manager,
