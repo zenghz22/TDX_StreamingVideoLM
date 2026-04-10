@@ -3,8 +3,8 @@ import gc
 import time
 import argparse
 
-from kvcache_generate_td import load_model, load_video
-from kvcache_manager_td import encode_video_managed
+from kvcache_generate_td import load_model, load_video, encode_video
+from kvcache_manager_td import KVCacheManager
 from kvcache_retrieve_td import decode_kvcache
 from kvcache_select_td import select_chunks
 from zhz_hardware_eval_utils import *
@@ -48,16 +48,21 @@ if __name__ == "__main__":
             video = load_video(video_path, sample_fps=1)
 
             monitor["mark"]("kvcache_encode_start")
-            manager = encode_video_managed(
-                video,
-                processor,
-                model=model,
-                chunk_size=16,
+            manager = KVCacheManager(
+                kv_cache_dir = kv_cache_path,
+                max_in_memory = args.encode_memory,
+                window_size = args.encode_window if args.encode_window > 0 else None,
+                device = "cpu",
+            )
+            encode_video(
+                video = video,
+                processor = processor,
+                model = model,
+                chunk_size = 16,
                 encode_prefix=encode_prefix,
                 stage_mark=monitor["mark"],
                 kv_cache_dir=kv_cache_path,
-                max_in_memory=args.encode_memory,
-                window_size=args.encode_window if args.encode_window > 0 else None,
+                manager=manager,
             )
             monitor["mark"]("kvcache_encode_done")
 
