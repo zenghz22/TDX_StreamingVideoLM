@@ -58,11 +58,20 @@ def _resolve_chunk_files_from_dir(kv_cache_dir, chunk_index=None, chunk_indices=
         missing = [i for i in chunk_indices if i not in idx_map]
         if missing:
             raise ValueError(f"chunk_indices {missing} not found in manifest: {manifest_path}")
-        selected_chunks = [idx_map[i] for i in chunk_indices]
-        selected = selected_chunks[-1]
-        selected_chunk_index = int(selected["chunk_index"])
-        print(f"Selected chunk_indices={chunk_indices} → loading {len(selected_chunks)} chunks up to index {selected_chunk_index}")
 
+        # RoPE 位置一致性保证：每个 chunk 的 K/V 向量在 encode 时绑定了其绝对位置。
+        # 若直接拼接非连续的 chunk（如 [0, 38, 39]），chunk 38 的 K 向量仍编码
+        # 位置 ~109364，但拼接后模型看到的相对位置是 ~551，两者相差 10 万+，
+        # RoPE 旋转角度完全错误，导致 attention 崩溃，产生乱码输出。
+        # 解决方案：始终加载连续范围 [min_idx, max_idx] 的全部 chunk。
+        min_idx = min(chunk_indices)
+        max_idx = max(chunk_indices)
+        selected_chunks = [c for c in chunks_sorted
+                           if min_idx <= int(c["chunk_index"]) <= max_idx]
+        selected = selected_chunks[-1]
+        print(f"[load_kv_cache] chunk_indices {sorted(chunk_indices)} → "
+              f"expanded to contiguous range [{min_idx}, {max_idx}] "
+              f"({len(selected_chunks)} chunks) for RoPE consistency.")
     else:
         if chunk_index is None:
             selected = chunks_sorted[-1]
@@ -126,8 +135,13 @@ def _concat_kv_segments(kv_segments):
     return tuple(full_kv)
 
 
-def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_indices=None):
-    """从磁盘加载 KV cache 与元信息（优先 safetensors）。"""
+def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_indices=None, crypto_ctx=None):
+    """从磁盘加载 KV cache 与元信息（优先 safetensors）。
+
+    crypto_ctx : CryptoContext | None
+        若提供，加载每个 shard 前自动检测 .enc 文件并解密。
+        None 或 enabled=False 时透明降级（行为与原来完全相同）。
+    """
     manifest = None
     selected_chunk = None
     resolved_path = kv_cache_path
@@ -138,7 +152,13 @@ def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_ind
         )
         kv_segments = []
         metadata = {}
-        for shard_path in resolved_files:
+        for shard_path, chunk_rec in zip(resolved_files, selected_chunks):
+            # ---- 解密接入点（crypto_ctx=None 时 no-op）----
+            if crypto_ctx is not None:
+                chunk_idx = int(chunk_rec["chunk_index"])
+                shard_path = crypto_ctx.maybe_decrypt_before_load(
+                    shard_path, chunk_index=chunk_idx
+                )
             shard_kv, shard_metadata = _load_single_safetensors_kv(shard_path, map_location=map_location)
             kv_segments.append(shard_kv)
             metadata = shard_metadata
@@ -189,14 +209,23 @@ def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_ind
     return kv_cache, metadata
 
 
-def _load_prefix_cache(kv_cache_dir: str, map_location: str = "cpu"):
+def _load_prefix_cache(kv_cache_dir: str, map_location: str = "cpu", crypto_ctx=None):
     """
     加载 prefix_cache.safetensors（encode_prefix 文字 token 的 KV）。
     若文件不存在返回 (None, 0)，兼容旧数据。
+    crypto_ctx 不为 None 时自动检测 .enc 文件并解密。
     """
     prefix_path = os.path.join(kv_cache_dir, "prefix_cache.safetensors")
-    if not os.path.exists(prefix_path):
+
+    # 解密路径：prefix_cache 用 chunk_index=-1 作为特殊标识
+    if crypto_ctx is not None:
+        try:
+            prefix_path = crypto_ctx.maybe_decrypt_before_load(prefix_path, chunk_index=-1)
+        except FileNotFoundError:
+            return None, 0   # 明文和密文均不存在
+    elif not os.path.exists(prefix_path):
         return None, 0
+
     prefix_kv, meta = _load_single_safetensors_kv(prefix_path, map_location=map_location)
     prefix_seq_len = int(prefix_kv[0][0].shape[-2]) if prefix_kv else 0
     print(f"[load_prefix_cache] Loaded prefix KV: {prefix_seq_len} tokens from {prefix_path}")
@@ -243,6 +272,7 @@ def decode_kvcache(
     repetition_penalty=1.1,
     decode_strategy="sample",
     suffix=None,
+    crypto_ctx=None,
 ):
     """加载 KV cache，直接文本解码，跳过视频预处理与编码。
 
@@ -253,6 +283,11 @@ def decode_kvcache(
     decode_strategy : str
         生成策略：
           - "sample": 采样（temperature/top_p/repetition_penalty 生效）
+          - "greedy": 贪心
+    suffix : str | None
+        直接作为 decode 输入文本，绕过 _build_decode_suffix。
+    crypto_ctx : CryptoContext | None
+        KV cache 解密上下文。None 时不解密（透明降级）。
           - "greedy": 贪心（忽略 top_p，temperature/repetition_penalty 不生效）
     suffix : str | None
         若提供，直接作为 decode 的文本输入，绕过 _build_decode_suffix。
@@ -261,6 +296,7 @@ def decode_kvcache(
     kv_cache, metadata = load_kv_cache(
         kv_cache_path, map_location="cpu",
         chunk_index=chunk_index, chunk_indices=chunk_indices,
+        crypto_ctx=crypto_ctx,
     )
     if not kv_cache:
         raise ValueError("KV cache is empty.")
@@ -277,7 +313,7 @@ def decode_kvcache(
     # chunk shard 存的是视频 visual token 的 delta KV（位置 P+... ）。
     # 两者拼接后，各段 K/V 向量保留其 encode 时的绝对位置，RoPE 正确。
     if os.path.isdir(kv_cache_path):
-        prefix_kv, prefix_seq_len = _load_prefix_cache(kv_cache_path, map_location="cpu")
+        prefix_kv, prefix_seq_len = _load_prefix_cache(kv_cache_path, map_location="cpu", crypto_ctx=crypto_ctx)
         if prefix_kv is not None and kv_cache:
             prefix_kv_dev = tuple((k.to(device), v.to(device)) for k, v in prefix_kv)
             kv_cache = _concat_kv_segments([prefix_kv_dev, kv_cache])
@@ -351,33 +387,19 @@ def decode_kvcache(
         generated.append(next_token)
         generated_token_ids.append(int(next_token.item()))
 
-        # 追踪下一个生成 token 的正确绝对位置。
-        # prefill 之后，下一个 token 应在 full_merged_seq_len + current_seq_len 处。
-        # 每步 +1。需要 position_ids 修正的条件：full_merged_seq_len > past_seq_len
-        # （即加载了非完整 KV 子集）。
-        need_pos_correction = full_merged_seq_len > past_seq_len
-        next_token_pos = full_merged_seq_len + current_seq_len  # 第一个生成 token 的位置
-
         for step_idx in range(max_new_tokens - 1):
             step_attention_mask = torch.ones(
                 (1, past_seq_len + current_seq_len + len(generated)),
                 dtype=model_inputs["attention_mask"].dtype,
                 device=device,
             )
-            step_kwargs = dict(
+            step_outputs = model(
                 input_ids=next_token,
                 attention_mask=step_attention_mask,
                 past_key_values=past,
                 use_cache=True,
                 return_dict=True,
             )
-            if need_pos_correction:
-                step_kwargs["position_ids"] = torch.tensor(
-                    [[next_token_pos]], dtype=torch.long, device=device
-                )
-            step_outputs = model(**step_kwargs)
-            next_token_pos += 1
-
             past = step_outputs.past_key_values
             logits = step_outputs.logits[:, -1, :]
 

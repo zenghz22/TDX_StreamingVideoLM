@@ -1,3 +1,4 @@
+from __future__ import annotations
 '''对分块的离线KVcache进行加密与解密'''
 """kvcache_crypt_td.py
 
@@ -54,17 +55,19 @@ Notes
 - In TDX, replace the master-key provider with a sealing-key-derived secret.
 """
 
-from __future__ import annotations
-
 import base64
 import hashlib
 import hmac
 import json
 import os
 import struct
+import tempfile as _tempfile
+import atexit as _atexit
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
+
+_CRYPTO_IMPORT_ERROR = None   # 预声明，避免 _require_crypto 中 NameError
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -75,8 +78,6 @@ except Exception as e:  # pragma: no cover
     HKDF = None  # type: ignore
     hashes = None  # type: ignore
     _CRYPTO_IMPORT_ERROR = e
-else:
-    _CRYPTO_IMPORT_ERROR = None
 
 try:
     import torch
@@ -325,7 +326,10 @@ def encrypt_chunk_file(
     aad: Union[bytes, ChunkAAD, Dict[str, Any], None] = None,
     remove_source: bool = False,
 ) -> Dict[str, Any]:
-    """Encrypt a chunk shard file (e.g. safetensors) into an encrypted file."""
+    """Encrypt a chunk shard file (e.g. safetensors) into an encrypted file.
+
+    使用原子写入（先写 .tmp 再 rename）避免进程崩溃导致数据丢失。
+    """
     src_plain_path = Path(src_plain_path)
     dst_enc_path = Path(dst_enc_path)
 
@@ -333,11 +337,21 @@ def encrypt_chunk_file(
     blob = encrypt_bytes_to_blob(plaintext, master_key, chunk_index=chunk_index, aad=aad)
 
     dst_enc_path.parent.mkdir(parents=True, exist_ok=True)
-    dst_enc_path.write_bytes(blob)
+    # 原子写入：先写临时文件，成功后再 rename
+    tmp_path = dst_enc_path.with_suffix(dst_enc_path.suffix + ".tmp")
     try:
-        os.chmod(dst_enc_path, 0o600)
+        tmp_path.write_bytes(blob)
+        try:
+            os.chmod(tmp_path, 0o600)
+        except Exception:
+            pass
+        tmp_path.replace(dst_enc_path)   # 原子 rename（同文件系统上 POSIX 保证原子性）
     except Exception:
-        pass
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
     if remove_source:
         try:
@@ -483,6 +497,221 @@ def decrypt_chunk_by_index(
     enc = chunk_enc_path(kv_cache_dir, chunk_index)
     plain = str(Path(kv_cache_dir) / f"chunk_{chunk_index:05d}.safetensors{write_plain_suffix}")
     return decrypt_chunk_file(enc, plain, master_key, expected_chunk_index=chunk_index, expected_aad=aad, remove_source=remove_source)
+
+
+# ---------------------------------------------------------------------------
+# CryptoContext：一体化管道接入层
+# ---------------------------------------------------------------------------
+
+class CryptoContext:
+    """
+    持有 master_key、控制加密开关的轻量上下文对象。
+
+    Parameters
+    ----------
+    master_key : bytes
+        32 字节 AES-256 主密钥。
+    enabled : bool
+        False 时所有 maybe_* 操作均为 no-op。
+    tmp_dir : str | None
+        解密临时文件目录。None = 系统 /tmp。
+    remove_plain_after_encrypt : bool
+        加密成功后是否删除明文 .safetensors 文件（生产环境建议 True）。
+
+    典型用法
+    --------
+    # 首次运行：自动创建 32 字节密钥文件
+    ctx = CryptoContext.from_key_file("../data/master.key")
+
+    # 禁用加密（兼容旧流程）
+    ctx = CryptoContext.disabled()
+
+    # TDX Sealing Key 场景（替换 master_key 来源）
+    # from tdx_sdk import get_sealing_key
+    # ctx = CryptoContext(master_key=derive_master_key_from_seed(get_sealing_key()))
+    """
+
+    def __init__(
+        self,
+        master_key: bytes,
+        *,
+        enabled: bool = True,
+        tmp_dir: Optional[str] = None,
+        remove_plain_after_encrypt: bool = True,
+    ):
+        self.master_key = master_key
+        self.enabled = enabled
+        self.tmp_dir = tmp_dir
+        self.remove_plain_after_encrypt = remove_plain_after_encrypt
+        self._tmp_files: list = []   # 追踪临时解密文件，用于退出时清理
+
+    @classmethod
+    def from_key_file(
+        cls,
+        key_path: Union[str, os.PathLike],
+        *,
+        create: bool = True,
+        **kwargs,
+    ) -> "CryptoContext":
+        """从文件加载 master key，文件不存在时按 create 决定是否新建。"""
+        key = load_or_create_local_master_key(key_path, create=create)
+        return cls(master_key=key, **kwargs)
+
+    @classmethod
+    def disabled(cls) -> "CryptoContext":
+        """返回一个禁用的 context，透明兼容非加密路径。"""
+        return cls(master_key=b"\x00" * 32, enabled=False)
+
+    # ----------------------------------------------------------------
+    # Encode 侧接入点
+    # ----------------------------------------------------------------
+
+    def maybe_encrypt_after_save(
+        self,
+        plain_path: Union[str, os.PathLike],
+        *,
+        chunk_index: int,
+        seq_start: int = 0,
+        seq_end: int = 0,
+        chunk_size: int = 16,
+        num_frames: int = 0,
+        model_name: str = "",
+        prefix_text: str = "",
+    ) -> Optional[str]:
+        """
+        save_kv_cache() 完成后立即加密，可选删除明文。
+
+        Parameters
+        ----------
+        plain_path : 刚写入的 .safetensors 路径
+        chunk_index / seq_* / ... : 构造 ChunkAAD 的元数据
+
+        Returns
+        -------
+        enc_path : str（加密文件路径）或 None（未启用时）
+        """
+        if not self.enabled:
+            return None
+
+        plain_path = Path(plain_path)
+        enc_path = plain_path.with_suffix(plain_path.suffix + ".enc")
+
+        aad = ChunkAAD(
+            chunk_index=chunk_index,
+            seq_start=seq_start,
+            seq_end=seq_end,
+            chunk_size=chunk_size,
+            num_frames=num_frames,
+            model_name_or_path=model_name,
+            prefix_text=prefix_text,
+            is_delta_chunk=True,
+        )
+
+        try:
+            encrypt_chunk_file(
+                plain_path,
+                enc_path,
+                self.master_key,
+                chunk_index=chunk_index,
+                aad=aad,
+                remove_source=self.remove_plain_after_encrypt,
+            )
+            print(f"[crypto] Encrypted chunk {chunk_index} → {enc_path.name}")
+            return str(enc_path)
+        except KVCryptoError as e:
+            print(f"[crypto] WARNING: Encryption failed for chunk {chunk_index}: {e}")
+            return None
+
+    # ----------------------------------------------------------------
+    # Decode 侧接入点
+    # ----------------------------------------------------------------
+
+    def maybe_decrypt_before_load(
+        self,
+        shard_path: Union[str, os.PathLike],
+        *,
+        chunk_index: int,
+        expected_aad: Union[bytes, ChunkAAD, Dict[str, Any], None] = None,
+    ) -> str:
+        """
+        加载 shard 前检测是否存在 .enc 文件，若存在则解密到临时路径并返回。
+
+        透明降级规则：
+          1. ctx 未启用 → 直接返回 shard_path
+          2. 明文文件存在 → 直接返回（兼容旧数据 / 非加密目录）
+          3. .enc 文件存在 → 解密到 tmp_dir 后返回临时路径
+          4. 两者均不存在 → 抛出 FileNotFoundError
+
+        临时文件会在进程退出时自动清理（通过 atexit）。
+
+        Parameters
+        ----------
+        shard_path : 期望的 .safetensors 路径（无论是否已加密）
+        chunk_index : 用于 HKDF 密钥派生和 AAD 验证
+        expected_aad : 可选，若提供则严格验证 AAD（防篡改）
+
+        Returns
+        -------
+        可直接传入 _load_single_safetensors_kv() 的路径字符串
+        """
+        shard_path = Path(shard_path)
+
+        if not self.enabled:
+            return str(shard_path)
+
+        # 明文已存在（旧数据或非加密模式）
+        if shard_path.exists():
+            return str(shard_path)
+
+        enc_path = shard_path.with_suffix(shard_path.suffix + ".enc")
+        if not enc_path.exists():
+            raise FileNotFoundError(
+                f"Neither plain ({shard_path.name}) nor encrypted ({enc_path.name}) found "
+                f"in {shard_path.parent}"
+            )
+
+        # 解密到临时目录，保留 .safetensors 扩展名
+        tmp_dir = self.tmp_dir or _tempfile.gettempdir()
+        os.makedirs(tmp_dir, exist_ok=True)
+        tmp_plain = Path(tmp_dir) / shard_path.name
+
+        try:
+            decrypt_chunk_file(
+                enc_path,
+                tmp_plain,
+                self.master_key,
+                expected_chunk_index=chunk_index,
+                expected_aad=expected_aad,
+                remove_source=False,   # 不删除 .enc
+            )
+        except KVCryptoError as e:
+            raise KVCryptoError(
+                f"Failed to decrypt chunk {chunk_index} from {enc_path.name}: {e}"
+            ) from e
+
+        print(f"[crypto] Decrypted chunk {chunk_index} → {tmp_plain.name} (tmp)")
+
+        # 注册 atexit 清理，防止临时文件堆积
+        tmp_str = str(tmp_plain)
+        if tmp_str not in self._tmp_files:
+            self._tmp_files.append(tmp_str)
+            _atexit.register(_try_unlink, tmp_str)
+
+        return str(tmp_plain)
+
+    def cleanup_tmp(self) -> None:
+        """手动清理已解密的临时文件（可选，atexit 也会自动清理）。"""
+        for p in self._tmp_files:
+            _try_unlink(p)
+        self._tmp_files.clear()
+
+
+def _try_unlink(path: str) -> None:
+    """静默删除文件，失败不抛出。"""
+    try:
+        os.unlink(path)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------

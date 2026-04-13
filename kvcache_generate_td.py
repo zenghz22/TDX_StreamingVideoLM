@@ -155,15 +155,13 @@ def _write_retrieval_index(kv_cache_dir, chunk_indices, layer_key_vecs, summary_
 # 前缀编码与保存（prefix_cache.safetensors）
 # ---------------------------------------------------------------------------
 
-def _encode_and_save_prefix(encode_prefix, processor, model, kv_cache_dir, device):
+def _encode_and_save_prefix(encode_prefix, processor, model, kv_cache_dir, device, crypto_ctx=None):
     """
     单独 forward encode_prefix 文字（无视频），将 prefix KV 存为
     prefix_cache.safetensors。
 
-    好处：
-    - 各 chunk shard 只含视频 visual token 的 delta KV（不含前缀文字 token）
-    - decode 时始终加载轻量 prefix_cache，再拼接连续窗口
-    - 彻底解除"chunk 0 必须被选"的约束，避免非连续 chunk 的 RoPE 位置错乱
+    crypto_ctx : CryptoContext | None
+        不为 None 时，保存后立即加密为 prefix_cache.safetensors.enc 并删除明文。
     """
     if not encode_prefix or not encode_prefix.strip():
         return None, 0
@@ -195,6 +193,20 @@ def _encode_and_save_prefix(encode_prefix, processor, model, kv_cache_dir, devic
                                       "prefix_text": text})
         print(f"[encode_prefix] Saved to {prefix_path}")
 
+        # 加密 prefix_cache（使用 chunk_index=-1 作为特殊 HKDF 标识）
+        if crypto_ctx is not None:
+            from pathlib import Path as _Path
+            crypto_ctx.maybe_encrypt_after_save(
+                prefix_path,
+                chunk_index=-1,
+                seq_start=0,
+                seq_end=prefix_seq_len,
+                chunk_size=0,
+                num_frames=0,
+                model_name=str(getattr(model.config, "_name_or_path", "")),
+                prefix_text=text,
+            )
+
     return prefix_kv, prefix_seq_len
 
 
@@ -211,6 +223,8 @@ def encode_video(
     stage_mark=None,
     kv_cache_dir=None,
     manager=None,           # 可选：KVCacheManager 实例
+    prune_ctx=None,         # 可选：video_token_prune_td.PruneContext
+    crypto_ctx=None,        # 可选：kvcache_crypto_td.CryptoContext
 ):
     """
     将视频分块编码成 KV cache。
@@ -220,6 +234,13 @@ def encode_video(
     manager : KVCacheManager | None
         若提供，则由 manager 负责内存调度（LRU + 可选滑动窗口）。
         若为 None，退回原有行为（全量 KV 常驻内存）。
+    prune_ctx : PruneContext | None
+        视觉 token 剪枝上下文（video_token_prune_td.PruneContext）。
+        None 时不剪枝。支持两级：帧级时序去冗余 + ViT 输出后空间剪枝。
+    crypto_ctx : CryptoContext | None
+        KV cache 加密上下文（kvcache_crypto_td.CryptoContext）。
+        None 或 enabled=False 时不加密。每个 chunk shard 保存后立即加密，
+        删除明文，decode 侧透明解密。
 
     行为说明
     --------
@@ -264,17 +285,53 @@ def encode_video(
     if model is not None:
         device_tmp = next(model.parameters()).device
         prefix_kv, prefix_seq_len = _encode_and_save_prefix(
-            encode_prefix, processor, model, kv_cache_dir, device_tmp
+            encode_prefix, processor, model, kv_cache_dir, device_tmp,
+            crypto_ctx=crypto_ctx,
         )
         # manager 的 _full_merged_seq_len 从 prefix_seq_len 开始累积
         if use_manager and prefix_seq_len > 0:
             manager._full_merged_seq_len = prefix_seq_len
+
+    # ---- 视觉 token 剪枝：安装 Level-1 spatial hook（一次性，在循环外）----
+    # hook 挂在 multi_modal_projector（pool+MLP 之后），输出 [total_tokens, D_llm]
+    # 每次 forward 前需要更新实际帧数，供 hook 正确 reshape
+    _spatial_hook_obj = None
+    _spatial_hook_handle = None
+    if prune_ctx is not None and model is not None:
+        try:
+            from video_token_prune_td import install_spatial_hook
+            _spatial_hook_obj, _spatial_hook_handle = install_spatial_hook(model, prune_ctx)
+        except ImportError:
+            print("[encode_video] Warning: video_token_prune_td not found, spatial pruning disabled.")
 
     try:
         for i in range(num_chunks):
             chunk = video[i * chunk_size : min((i + 1) * chunk_size, num_frames)]
             if stage_mark is not None:
                 stage_mark(f"chunk_{i}_start")
+
+            frames_before_prune = len(chunk)
+
+            # ---- Level-0 帧级时序去冗余（在 processor 之前，纯 numpy）----
+            if prune_ctx is not None:
+                try:
+                    from video_token_prune_td import temporal_filter_chunk
+                    chunk = temporal_filter_chunk(chunk, prune_ctx, chunk_idx=i)
+                    if len(chunk) == 0:
+                        print(f"[prune] chunk {i}: all frames filtered, skipping.")
+                        continue
+                    if len(chunk) != frames_before_prune:
+                        print(
+                            f"[prune:temporal] chunk {i}: "
+                            f"{frames_before_prune} → {len(chunk)} frames "
+                            f"({len(chunk)/frames_before_prune:.0%} kept)"
+                        )
+                except ImportError:
+                    pass
+
+            # Level-1 hook 需要知道本次 forward 实际有多少帧
+            if _spatial_hook_obj is not None:
+                _spatial_hook_obj.update_num_frames(len(chunk))
 
             pixel_values = processor.video_processor(chunk, return_tensors="pt").pixel_values_videos.to("cpu")
             print(f"[chunk {i}] pixel_values_videos shape: {tuple(pixel_values.shape)}")
@@ -473,6 +530,19 @@ def encode_video(
                     },
                 )
 
+                # ---- 加密 chunk shard（可选）----
+                if crypto_ctx is not None:
+                    crypto_ctx.maybe_encrypt_after_save(
+                        shard_path,
+                        chunk_index=i,
+                        seq_start=int(past_kv_seq_len),
+                        seq_end=int(full_kv_seq_len),
+                        chunk_size=chunk_size,
+                        num_frames=int(num_frames),
+                        model_name=str(shard_metadata.get("model_name_or_path", "")),
+                        prefix_text=str(encode_prefix or ""),
+                    )
+
                 if not common_metadata:
                     common_metadata = {
                         "encode_prefix": encode_prefix,
@@ -524,9 +594,17 @@ def encode_video(
                 )
 
     finally:
-        # 无论是否发生异常，都清理 position hook
+        # 无论是否发生异常，都清理 position hook 和 spatial prune hook
         if use_manager and manager.window_size is not None:
             manager.remove_position_hook()
+        if _spatial_hook_handle is not None:
+            try:
+                from video_token_prune_td import remove_spatial_hook
+                remove_spatial_hook(_spatial_hook_handle)
+            except ImportError:
+                _spatial_hook_handle.remove()  # fallback
+        if prune_ctx is not None and prune_ctx.log_stats:
+            print(prune_ctx.summary())
 
     if kv_cache_dir is not None:
         # 把真实的 full_merged_seq_len 写入 common_metadata，
