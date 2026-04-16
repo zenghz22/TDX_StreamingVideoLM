@@ -10,7 +10,7 @@ run_decode(){
     local decode_select=$1
     local encode_window=$2
     local name="decode_S${decode_select}_W${encode_window}"
-    HF_ENDPOINT='https://hf-mirror.com' python main_td.py --mode "decode" --decode_select $decode_select --plot_file "../results/plots/${name}.png"   > ../results/logs/${name}.log 2>&1
+    HF_ENDPOINT='https://hf-mirror.com' python main_td.py --mode "decode" --decode_select $decode_select --encode_window $encode_window --plot_file "../results/plots/${name}.png"   > ../results/logs/${name}.log 2>&1
 }
 
 run_encode_decode(){
@@ -40,7 +40,7 @@ run_decode_decrypt(){
     local encode_window=$2
     local name="decode_decrypt_S${decode_select}_W${encode_window}"
     HF_ENDPOINT='https://hf-mirror.com' python main_td.py \
-    --mode "decode" --decode_select $decode_select \
+    --mode "decode" --decode_select $decode_select --encode_window $encode_window \
     --plot_file "../results/plots/${name}.png"   \
     --encrypt \
     > ../results/logs/${name}.log 2>&1
@@ -67,16 +67,37 @@ run_decode_prune(){
     local prune_spatial=$4
     local name="decode_S${decode_select}_W${encode_window}_PT${prune_temporal}_PS${prune_spatial}"
     HF_ENDPOINT='https://hf-mirror.com' python main_td.py \
-    --mode "decode" --decode_select $decode_select \
+    --mode "decode" --decode_select $decode_select --encode_window $encode_window\
     --plot_file "../results/plots/${name}.png"   \
     > ../results/logs/${name}.log 2>&1
 }
 
-#run_encode 16 8
-#run_decode 8 8
+run_encode 16 8
+run_decode 8 8
 
-#run_encode_prune 16 8   1 1
-#run_decode_prune 8 8    1 1
+run_encode_prune 16 8   1 1
+run_decode_prune 8 8    1 1 
 
-run_encode_prune 16 8   0.8 0.75
-run_decode_prune 8 8    0.8 0.75
+run_encode_prune 16 8   1 0.75
+run_decode_prune 8 8    1 0.75
+
+run_encode_prune 16 8   1 0.5
+run_decode_prune 8 8    1 0.5 
+
+run_encode_prune 16 8   0.75 1
+run_decode_prune 8 8    0.75 1 
+
+run_encode_prune 16 8   0.75 0.75
+run_decode_prune 8 8    0.75 0.75
+
+run_encode_prune 16 8   0.75 0.5
+run_decode_prune 8 8    0.75 0.5 
+
+run_encode_prune 16 8   0.5 1
+run_decode_prune 8 8    0.5 1 
+
+run_encode_prune 16 8   0.5 0.75
+run_decode_prune 8 8    0.5 0.75 
+
+run_encode_prune 16 8   0.5 0.5
+run_decode_prune 8 8    0.5 0.5

@@ -292,17 +292,11 @@ def encode_video(
         if use_manager and prefix_seq_len > 0:
             manager._full_merged_seq_len = prefix_seq_len
 
-    # ---- 视觉 token 剪枝：安装 Level-1 spatial hook（一次性，在循环外）----
-    # hook 挂在 multi_modal_projector（pool+MLP 之后），输出 [total_tokens, D_llm]
-    # 每次 forward 前需要更新实际帧数，供 hook 正确 reshape
-    _spatial_hook_obj = None
-    _spatial_hook_handle = None
-    if prune_ctx is not None and model is not None:
-        try:
-            from video_token_prune_td import install_spatial_hook
-            _spatial_hook_obj, _spatial_hook_handle = install_spatial_hook(model, prune_ctx)
-        except ImportError:
-            print("[encode_video] Warning: video_token_prune_td not found, spatial pruning disabled.")
+    # ---- 剪枝说明 ────────────────────────────────────────────────────────
+    # Level 0 temporal: 在 processor 之前减少帧数（有效）
+    # Level 1 spatial:  在 processor 之前降低分辨率（有效）
+    # ⚠️  mid-forward hook spatial 已移除（不兼容 LLaVA-OV attention_mask 预构建）
+    # ────────────────────────────────────────────────────────────────────
 
     try:
         for i in range(num_chunks):
@@ -315,7 +309,7 @@ def encode_video(
             # ---- Level-0 帧级时序去冗余（在 processor 之前，纯 numpy）----
             if prune_ctx is not None:
                 try:
-                    from video_token_prune_td import temporal_filter_chunk
+                    from video_prune import temporal_filter_chunk
                     chunk = temporal_filter_chunk(chunk, prune_ctx, chunk_idx=i)
                     if len(chunk) == 0:
                         print(f"[prune] chunk {i}: all frames filtered, skipping.")
@@ -329,9 +323,13 @@ def encode_video(
                 except ImportError:
                     pass
 
-            # Level-1 hook 需要知道本次 forward 实际有多少帧
-            if _spatial_hook_obj is not None:
-                _spatial_hook_obj.update_num_frames(len(chunk))
+            # ---- Level-1 像素级降分辨率（在 processor 之前，Pillow resize）----
+            if prune_ctx is not None:
+                try:
+                    from video_prune import spatial_downscale_chunk
+                    chunk = spatial_downscale_chunk(chunk, prune_ctx, chunk_idx=i)
+                except ImportError:
+                    pass
 
             pixel_values = processor.video_processor(chunk, return_tensors="pt").pixel_values_videos.to("cpu")
             print(f"[chunk {i}] pixel_values_videos shape: {tuple(pixel_values.shape)}")
@@ -594,15 +592,9 @@ def encode_video(
                 )
 
     finally:
-        # 无论是否发生异常，都清理 position hook 和 spatial prune hook
+        # 无论是否发生异常，都清理 position hook
         if use_manager and manager.window_size is not None:
             manager.remove_position_hook()
-        if _spatial_hook_handle is not None:
-            try:
-                from video_token_prune_td import remove_spatial_hook
-                remove_spatial_hook(_spatial_hook_handle)
-            except ImportError:
-                _spatial_hook_handle.remove()  # fallback
         if prune_ctx is not None and prune_ctx.log_stats:
             print(prune_ctx.summary())
 

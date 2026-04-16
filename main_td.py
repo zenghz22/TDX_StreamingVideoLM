@@ -28,14 +28,16 @@ if __name__ == "__main__":
     parser.add_argument("--decode_select", type=int, default=0)
 
     # ── 剪枝参数 ──────────────────────────────────────────────────────────
-    parser.add_argument("--prune", action="store_true")
+    parser.add_argument("--prune", action="store_true",
+                        help="启用视频 token 剪枝（encode 时启用，decode 时自动兼容）")
     parser.add_argument("--prune_temporal", type=float, default=0.0,
-                        help="帧级时序去冗余阈值（cosine sim）。0 = 不启用。推荐 0.92-0.97")
+                        help="帧级时序去冗余：目标保留帧比例（0~1）。"
+                             "0 = 不启用。0.6 = 每 chunk 保留约 60%% 的帧。"
+                             "内部自动推算 cosine 阈值并在日志中打印。推荐 0.4~0.8。")
     parser.add_argument("--prune_spatial", type=float, default=0.0,
-                        help="空间 token 保留比例（0~1）。0 = 不启用。推荐 0.4-0.7")
-    parser.add_argument("--prune_metric", type=str, default="norm",
-                        choices=["norm", "var", "tome"],
-                        help="空间剪枝重要性度量方式")
+                        help="空间降分辨率：像素面积保留比例（0~1）。"
+                             "0 = 不启用。0.5 = 面积缩小至 50%%（长宽各 ×√0.5≈0.707），保留宽高比。"
+                             "推荐 0.3~0.7。")
 
     # ── 加密参数 ──────────────────────────────────────────────────────────
     parser.add_argument("--encrypt", action="store_true",
@@ -48,32 +50,28 @@ if __name__ == "__main__":
     model_path    = "llava-hf/llava-onevision-qwen2-7b-ov-hf"
     video_path    = "../data/haimian_7.mp4"
     kv_cache_path = "../data/kv_cache_chunks"
-    #question      = "Who is the green toy character appearing in the video?"
-    #question      = "What is the material of the spoon at the end of the video?"
-    #question      = "How are you feeling after watching the video?"
-    question      = "Who is the main character in the video?"
+    question      = "Who is in the video, and what are they doing?"
     encode_prefix = "Please understand the video and be ready to answer the single-choice question based on the video content. "
 
     # ── 构建 PruneContext（encode 侧使用）────────────────────────────────
     prune_ctx = None
     if args.prune and (args.prune_temporal > 0 or args.prune_spatial > 0):
         try:
-            from video_token_prune_td import PruneContext
+            from video_prune import PruneContext
             prune_ctx = PruneContext(
                 enabled=True,
                 temporal_enabled=(args.prune_temporal > 0),
-                temporal_threshold=args.prune_temporal if args.prune_temporal > 0 else 0.95,
+                temporal_keep_ratio=args.prune_temporal if args.prune_temporal > 0 else 0.6,
                 spatial_enabled=(args.prune_spatial > 0),
-                spatial_keep_ratio=args.prune_spatial if args.prune_spatial > 0 else 0.5,
-                spatial_metric=args.prune_metric,
+                spatial_ratio=args.prune_spatial if args.prune_spatial > 0 else None,
                 log_stats=True,
             )
             logger.info(
-                f"[prune] Enabled: temporal={args.prune_temporal}, "
-                f"spatial={args.prune_spatial} ({args.prune_metric})"
+                f"[prune] Enabled: temporal_keep_ratio={args.prune_temporal}, "
+                f"spatial_ratio={args.prune_spatial}"
             )
         except ImportError:
-            logger.warning("[prune] video_token_prune_td not found, pruning disabled.")
+            logger.warning("[prune] video_prune not found, pruning disabled.")
 
     # ── 构建 CryptoContext（encode/decode 双侧使用）───────────────────────
     crypto_ctx = None
@@ -95,7 +93,7 @@ if __name__ == "__main__":
             processor, model = load_model(model_path, load_weights=True)
             inject_timing_hook_to_model(model, event_callback=monitor["mark"])
 
-            video = load_video(video_path, sample_fps=0.5)
+            video = load_video(video_path, sample_fps=1)
 
             monitor["mark"]("kvcache_encode_start")
             manager = KVCacheManager(
@@ -160,6 +158,6 @@ if __name__ == "__main__":
             gc.collect()
             time.sleep(10)
 
-            # 解码完成后清理解密临时文件
-            if crypto_ctx is not None:
-                crypto_ctx.cleanup_tmp()
+        # 解码完成后清理解密临时文件
+        if crypto_ctx is not None:
+            crypto_ctx.cleanup_tmp()
