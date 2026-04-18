@@ -135,13 +135,8 @@ def _concat_kv_segments(kv_segments):
     return tuple(full_kv)
 
 
-def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_indices=None, crypto_ctx=None):
-    """从磁盘加载 KV cache 与元信息（优先 safetensors）。
-
-    crypto_ctx : CryptoContext | None
-        若提供，加载每个 shard 前自动检测 .enc 文件并解密。
-        None 或 enabled=False 时透明降级（行为与原来完全相同）。
-    """
+def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_indices=None):
+    """从磁盘加载 KV cache 与元信息（优先 safetensors）。"""
     manifest = None
     selected_chunk = None
     resolved_path = kv_cache_path
@@ -152,13 +147,7 @@ def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_ind
         )
         kv_segments = []
         metadata = {}
-        for shard_path, chunk_rec in zip(resolved_files, selected_chunks):
-            # ---- 解密接入点（crypto_ctx=None 时 no-op）----
-            if crypto_ctx is not None:
-                chunk_idx = int(chunk_rec["chunk_index"])
-                shard_path = crypto_ctx.maybe_decrypt_before_load(
-                    shard_path, chunk_index=chunk_idx
-                )
+        for shard_path in resolved_files:
             shard_kv, shard_metadata = _load_single_safetensors_kv(shard_path, map_location=map_location)
             kv_segments.append(shard_kv)
             metadata = shard_metadata
@@ -209,23 +198,14 @@ def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_ind
     return kv_cache, metadata
 
 
-def _load_prefix_cache(kv_cache_dir: str, map_location: str = "cpu", crypto_ctx=None):
+def _load_prefix_cache(kv_cache_dir: str, map_location: str = "cpu"):
     """
     加载 prefix_cache.safetensors（encode_prefix 文字 token 的 KV）。
     若文件不存在返回 (None, 0)，兼容旧数据。
-    crypto_ctx 不为 None 时自动检测 .enc 文件并解密。
     """
     prefix_path = os.path.join(kv_cache_dir, "prefix_cache.safetensors")
-
-    # 解密路径：prefix_cache 用 chunk_index=-1 作为特殊标识
-    if crypto_ctx is not None:
-        try:
-            prefix_path = crypto_ctx.maybe_decrypt_before_load(prefix_path, chunk_index=-1)
-        except FileNotFoundError:
-            return None, 0   # 明文和密文均不存在
-    elif not os.path.exists(prefix_path):
+    if not os.path.exists(prefix_path):
         return None, 0
-
     prefix_kv, meta = _load_single_safetensors_kv(prefix_path, map_location=map_location)
     prefix_seq_len = int(prefix_kv[0][0].shape[-2]) if prefix_kv else 0
     print(f"[load_prefix_cache] Loaded prefix KV: {prefix_seq_len} tokens from {prefix_path}")
@@ -272,7 +252,6 @@ def decode_kvcache(
     repetition_penalty=1.1,
     decode_strategy="sample",
     suffix=None,
-    crypto_ctx=None,
 ):
     """加载 KV cache，直接文本解码，跳过视频预处理与编码。
 
@@ -283,11 +262,6 @@ def decode_kvcache(
     decode_strategy : str
         生成策略：
           - "sample": 采样（temperature/top_p/repetition_penalty 生效）
-          - "greedy": 贪心
-    suffix : str | None
-        直接作为 decode 输入文本，绕过 _build_decode_suffix。
-    crypto_ctx : CryptoContext | None
-        KV cache 解密上下文。None 时不解密（透明降级）。
           - "greedy": 贪心（忽略 top_p，temperature/repetition_penalty 不生效）
     suffix : str | None
         若提供，直接作为 decode 的文本输入，绕过 _build_decode_suffix。
@@ -296,7 +270,6 @@ def decode_kvcache(
     kv_cache, metadata = load_kv_cache(
         kv_cache_path, map_location="cpu",
         chunk_index=chunk_index, chunk_indices=chunk_indices,
-        crypto_ctx=crypto_ctx,
     )
     if not kv_cache:
         raise ValueError("KV cache is empty.")
@@ -313,7 +286,7 @@ def decode_kvcache(
     # chunk shard 存的是视频 visual token 的 delta KV（位置 P+... ）。
     # 两者拼接后，各段 K/V 向量保留其 encode 时的绝对位置，RoPE 正确。
     if os.path.isdir(kv_cache_path):
-        prefix_kv, prefix_seq_len = _load_prefix_cache(kv_cache_path, map_location="cpu", crypto_ctx=crypto_ctx)
+        prefix_kv, prefix_seq_len = _load_prefix_cache(kv_cache_path, map_location="cpu")
         if prefix_kv is not None and kv_cache:
             prefix_kv_dev = tuple((k.to(device), v.to(device)) for k, v in prefix_kv)
             kv_cache = _concat_kv_segments([prefix_kv_dev, kv_cache])
@@ -339,22 +312,36 @@ def decode_kvcache(
     )
     model_inputs["attention_mask"] = full_attention_mask
 
-    # ---- position_ids 修正 ----
-    # past_seq_len = 实际加载的 KV 长度（prefix + 选定窗口）
-    # full_merged_seq_len = encode 时所有 chunk 的完整 merged 总长
-    # question 的 Q 向量必须使用 full_merged_seq_len 作为起始绝对位置，
-    # 才能与各 chunk K 向量的真实绝对位置保持正确的 RoPE 相对距离。
+    # ---- position_ids：ReKV 连续位置策略 ----
+    # ReKV 论文（ICLR 2025）Section 3 "Positional Encoding"：
+    #   "we do not account for the original positions of the retrieved KV-Caches.
+    #    Instead, we treat these retrieved tokens as regular consecutive tokens."
+    #   "applying standard RoPE to retrieved video tokens leads to better performance."
+    #
+    # 实现：Q 的起始位置 = past_seq_len（实际加载的 KV 长度），而非 full_merged_seq_len。
+    #
+    # 原因：
+    #   - K 向量在 encode 时用 sliding-window，位置范围约 0~15000
+    #   - 若 Q 从 full_merged_seq_len（~50000）出发，Q-K 相对距离 ~49000，
+    #     远超 Qwen2-7B 32K 训练上下文，RoPE 完全分布外
+    #   - 若 Q 从 past_seq_len（~5600）出发，Q-K 相对距离 ~4600，
+    #     完全在训练分布内，与 ReKV 对齐
+    #
+    # 不设 position_ids 时 transformers 从 past_key_values 长度自动推断，效果等价；
+    # 此处显式设置以保证无歧义。
     full_merged_seq_len = int(metadata.get("full_merged_seq_len", past_seq_len))
-    if full_merged_seq_len > past_seq_len:
-        position_ids = torch.arange(
-            full_merged_seq_len,
-            full_merged_seq_len + current_seq_len,
-            device=device,
-            dtype=torch.long,
-        ).unsqueeze(0)
-        model_inputs["position_ids"] = position_ids
-        print(f"[decode] position_ids corrected: start={full_merged_seq_len} "
-              f"(loaded_kv={past_seq_len}, full={full_merged_seq_len})")
+    position_ids = torch.arange(
+        past_seq_len,
+        past_seq_len + current_seq_len,
+        device=device,
+        dtype=torch.long,
+    ).unsqueeze(0)
+    model_inputs["position_ids"] = position_ids
+    print(
+        f"[decode] position_ids: start={past_seq_len} (ReKV consecutive strategy)  "
+        f"loaded_kv={past_seq_len}, full_merged={full_merged_seq_len}  "
+        f"Q-K max relative dist ≈ {past_seq_len} (was {full_merged_seq_len} before fix)"
+    )
 
     for k, v in model_inputs.items():
         if isinstance(v, torch.Tensor):
@@ -377,6 +364,10 @@ def decode_kvcache(
         generated = []
         generated_token_ids = []
 
+        # next_token_pos：下一个待生成 token 的位置（紧接在 prefill 之后）
+        # 与 ReKV 策略一致：基于实际加载的 KV 长度，而非 full_merged_seq_len
+        next_token_pos = past_seq_len + current_seq_len
+
         logits = outputs.logits[:, -1, :]
         if decode_strategy == "greedy":
             next_token = torch.argmax(logits, dim=-1, keepdim=True)
@@ -393,13 +384,18 @@ def decode_kvcache(
                 dtype=model_inputs["attention_mask"].dtype,
                 device=device,
             )
+            step_position_ids = torch.tensor(
+                [[next_token_pos]], dtype=torch.long, device=device
+            )
             step_outputs = model(
                 input_ids=next_token,
                 attention_mask=step_attention_mask,
+                position_ids=step_position_ids,
                 past_key_values=past,
                 use_cache=True,
                 return_dict=True,
             )
+            next_token_pos += 1
             past = step_outputs.past_key_values
             logits = step_outputs.logits[:, -1, :]
 

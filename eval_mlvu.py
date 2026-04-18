@@ -50,7 +50,7 @@ if __name__ == "__main__":
     video_id = anon["video_id"]
     video_path = anon["video_path"]
     duration = anon["duration"]
-    encode_prefix = "Please understand the video and be ready to answer the single-choice question based on the video content. " 
+    encode_prefix = "You are a helpful assistant. Please understand the video content and prepare to answer single-choice questions." 
     
     # ── 编码阶段 ──────────────────────────────────────────────────────
     if args.mode == "encode_decode" or args.mode == "encode":
@@ -59,7 +59,7 @@ if __name__ == "__main__":
             processor, model = load_model(model_path, load_weights=True)
             inject_timing_hook_to_model(model, event_callback=monitor["mark"])
             
-            video = load_video(video_path, sample_fps=1)
+            video = load_video(video_path, sample_fps=0.5)
             monitor["mark"]("kvcache_encode_start")
             manager = KVCacheManager(
                 kv_cache_dir = kv_cache_path,
@@ -71,7 +71,7 @@ if __name__ == "__main__":
                 video = video,
                 processor = processor,
                 model = model,
-                chunk_size = 16,
+                chunk_size = 1,
                 encode_prefix=encode_prefix,
                 stage_mark=monitor["mark"],
                 kv_cache_dir=kv_cache_path,
@@ -113,7 +113,22 @@ if __name__ == "__main__":
                     correct_answer = conversation["answer"]
                     correct_letter = choice_letters[choices.index(correct_answer)]
                     question_type = conversation["question_type"]
-                    prompt = f"Question:{question}\nOptions:{formatted_choices}\nOnly give the best option with one letter.\nAnswer:"
+                    text_content = f"Question: {question}\nOptions:\n{formatted_choices}\nOnly give the best option."
+                    conversation_context = [{
+                        "role": "user",
+                        "content": [{
+                            "type": "text", "text": text_content
+                        }],
+                    }]
+                    prompt = processor.apply_chat_template(
+                        conversation_context,
+                        add_generation_prompt = True,
+                        tokenize=False,
+                    )
+                    print("======================================================")
+                    print(f"decode_select：{decode_select}")
+                    print("添加chat_template后Prompt为：")
+                    print(prompt)
 
                     if decode_select > 0:
                         top_k = decode_select
@@ -135,24 +150,36 @@ if __name__ == "__main__":
                         prompt,
                         processor,
                         model,
-                        max_new_tokens=8,
+                        max_new_tokens=1,
                         min_new_tokens=1,
                         temperature=0.0,
                         decode_strategy="sample",
                         chunk_indices=decode_chunk_ids,
-                        suffix=None,
+                        suffix=prompt,
                     )
-                    print(f"model answer: {model_answer}")
-                    print(choice_letters)
-                    print(choices)
+                    
+                    # 处理模型输出S
+                    # 1. 预处理：去掉换行和两端空格
+                    model_answer_stripped = model_answer.strip().replace("\n", " ")
 
-                    model_answer_stripped = model_answer.strip()
-                    if model_answer_stripped.lower().startswith("assistant"):
-                        model_answer_stripped = model_answer_stripped[len("assistant"):].strip()
-                    model_answer_stripped = model_answer_stripped.replace("\n", "").strip()
-                    letter_match = re.search(r'\b([A-H])\b', model_answer_stripped)
-                    model_letter = letter_match.group(1) if letter_match else None
+                    # 2. 核心逻辑：如果包含 "assistant" (不区分大小写)，提取其后的第一个 A-H
+                    if re.search(r'assistant', model_answer_stripped, re.IGNORECASE):
+                        # 匹配 assistant 后面紧跟的 A-H（中间允许有空格或冒号）
+                        # 例如："Assistant: B" -> 提取 B; "AassistantA" -> 提取后面的 A
+                        match_after = re.search(r'(?i)assistant\W*([A-H])', model_answer_stripped)
+                        model_letter = match_after.group(1) if match_after else None
+                    else:
+                        # 3. 如果不包含 "assistant"，则执行常规提取（提取第一个出现的独立字母）
+                        letter_match = re.search(r'\b([A-H])\b', model_answer_stripped)
+                        model_letter = letter_match.group(1) if letter_match else None
+
+                    # 4. 判断是否正确
                     is_correct = (model_letter == correct_letter)
+
+                    print(f"原始输出: {model_answer}")
+                    print(f"提取结果: {model_letter}")
+                    print(f"正确答案: {correct_letter}")
+                    print(f"是否正确: {is_correct}")
 
                     result = {
                         "anon_index": args.anon_index,
@@ -161,7 +188,8 @@ if __name__ == "__main__":
                         "video_id": video_id,
                         "question": question,
                         "choices": choices,
-                        "model_answer": model_answer_stripped,
+                        "model_answer_stripped": model_answer_stripped,
+                        "model_letter": model_letter,
                         "correct_letter": correct_letter,
                         "decode_chunk_indices": decode_chunk_ids if decode_chunk_ids is not None else "all",
                         "is_correct": is_correct
@@ -169,7 +197,7 @@ if __name__ == "__main__":
 
                     csv_file_path = f"../results/csv/mlvu_results_W{args.encode_window}_S{decode_select}.csv"
                     with open(csv_file_path, "a", newline='') as csvfile:
-                        fieldnames = ["anon_index", "encode_window", "decode_select", "video_id", "question", "choices", "model_answer", "correct_letter", "decode_chunk_indices", "is_correct"]
+                        fieldnames = ["anon_index", "encode_window", "decode_select", "video_id", "question", "choices", "model_answer_stripped", "model_letter", "correct_letter", "decode_chunk_indices", "is_correct"]
                         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                         if csvfile.tell() == 0:
                             writer.writeheader()
