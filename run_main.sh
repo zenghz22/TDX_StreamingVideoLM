@@ -72,32 +72,6 @@ run_decode_prune(){
     > ../results/logs/${name}.log 2>&1
 }
 
-run_encode 16 8
-run_decode 8 8
-
-run_encode_prune 16 8   1 1
-run_decode_prune 8 8    1 1 
-
-run_encode_prune 16 8   1 0.75
-run_decode_prune 8 8    1 0.75
-
-run_encode_prune 16 8   1 0.5
-run_decode_prune 8 8    1 0.5 
-
-run_encode_prune 16 8   0.75 1
-run_decode_prune 8 8    0.75 1 
-
-run_encode_prune 16 8   0.75 0.75
-run_decode_prune 8 8    0.75 0.75
-
-run_encode_prune 16 8   0.75 0.5
-run_decode_prune 8 8    0.75 0.5 
-
-run_encode_prune 16 8   0.5 1
-run_decode_prune 8 8    0.5 1 
-
-run_encode_prune 16 8   0.5 0.75
-run_decode_prune 8 8    0.5 0.75 
-
-run_encode_prune 16 8   0.5 0.5
-run_decode_prune 8 8    0.5 0.5
+run_encode_encrypt 256 32
+run_decode_decrypt 32 32
+run_decode_decrypt 64 32

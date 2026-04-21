@@ -135,6 +135,102 @@ def _concat_kv_segments(kv_segments):
     return tuple(full_kv)
 
 
+def _assemble_per_layer_kv(
+    kv_cache_dir: str,
+    per_layer_chunk_indices,   # List[List[int]]，长度=层数
+    *,
+    crypto_ctx=None,
+    map_location: str = "cpu",
+):
+    """
+    ReKV per-layer 独立检索的加载层：每层从各自选出的 chunk 集合里拼装 KV。
+
+    原理
+    ----
+    past_key_values 是 tuple[L] of (K_L, V_L)，HuggingFace 每层独立传入自己的 KV。
+    因此不同层携带不同 chunk 的内容完全合法，无需修改 attention 计算。
+
+    唯一约束：所有层的 T（序列维度）必须相同，因为 attention_mask 是全局共享的。
+    - 不开 temporal prune：所有 chunk T_chunk 相同（16帧×196tokens=3136），
+      k 个 chunk → T = k × 3136，自动满足。
+    - 开 temporal prune：不同 chunk T_chunk 可能不同，此时做 zero-padding 并输出警告。
+      zero-padded 的 K/V 对 attention 影响极小（Q·0=0，softmax 结果接近 0），
+      但若精度敏感，建议 eval 时关闭 temporal prune。
+
+    参数
+    ----
+    per_layer_chunk_indices : List[List[int]]
+        per_layer_chunk_indices[L] = 第 L 层选出的 chunk_index 列表
+
+    返回
+    ----
+    per_layer_kv : tuple[L] of (K_L, V_L)   - 可直接传入 _to_model_cache()
+    past_seq_len : int                        - 最大序列长度（含 padding）
+    """
+    manifest_path = os.path.join(kv_cache_dir, "manifest.json")
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    chunks_by_idx = {int(c["chunk_index"]): c for c in manifest.get("chunks", [])}
+
+    # ── 1. 找出所有层选择的 chunk 的并集，每个 shard 文件只加载一次 ────────
+    union_ids = sorted(set(ci for ids in per_layer_chunk_indices for ci in ids))
+    loaded_chunks: dict = {}   # chunk_idx → tuple[L] of (K, V)
+    for ci in union_ids:
+        if ci not in chunks_by_idx:
+            raise KeyError(f"chunk_index {ci} not in manifest")
+        c = chunks_by_idx[ci]
+        shard_path = os.path.join(kv_cache_dir, c["file"])
+        if crypto_ctx is not None:
+            shard_path = crypto_ctx.maybe_decrypt_before_load(shard_path, chunk_index=ci)
+        shard_kv, _ = _load_single_safetensors_kv(shard_path, map_location)
+        loaded_chunks[ci] = shard_kv   # tuple[L] of (K:[1,Hkv,T,D], V)
+
+    # ── 2. 逐层拼装各自的 KV ──────────────────────────────────────────────
+    n_layers = len(per_layer_chunk_indices)
+    per_layer_kv = []
+    seq_lens = []
+
+    for L_idx in range(n_layers):
+        selected = per_layer_chunk_indices[L_idx]
+        if not selected:
+            raise ValueError(f"layer {L_idx} has empty chunk selection")
+        K_list = [loaded_chunks[ci][L_idx][0] for ci in selected]  # [1,Hkv,T_ci,D]
+        V_list = [loaded_chunks[ci][L_idx][1] for ci in selected]
+        K_cat = torch.cat(K_list, dim=-2)   # [1, Hkv, T_L, D]
+        V_cat = torch.cat(V_list, dim=-2)
+        per_layer_kv.append((K_cat, V_cat))
+        seq_lens.append(K_cat.shape[-2])
+
+    # ── 3. 处理不等长（temporal prune 场景）─────────────────────────────────
+    unique_lens = set(seq_lens)
+    if len(unique_lens) > 1:
+        max_len = max(seq_lens)
+        min_len = min(seq_lens)
+        print(
+            f"[assemble_per_layer_kv] WARNING: layers have unequal seq_len "
+            f"(min={min_len}, max={max_len}). "
+            f"Zero-padding shorter layers to {max_len}. "
+            f"Consider disabling temporal pruning for eval to avoid this."
+        )
+        new_kv = []
+        for (K, V), T in zip(per_layer_kv, seq_lens):
+            if T < max_len:
+                pad = max_len - T
+                K = torch.cat([K, K.new_zeros(*K.shape[:-2], pad, K.shape[-1])], dim=-2)
+                V = torch.cat([V, V.new_zeros(*V.shape[:-2], pad, V.shape[-1])], dim=-2)
+            new_kv.append((K, V))
+        per_layer_kv = new_kv
+        past_seq_len = max_len
+    else:
+        past_seq_len = seq_lens[0]
+
+    print(
+        f"[assemble_per_layer_kv] Loaded {len(union_ids)} unique chunk files, "
+        f"assembled {n_layers} layers × {past_seq_len} tokens."
+    )
+    return tuple(per_layer_kv), past_seq_len
+
+
 def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_indices=None):
     """从磁盘加载 KV cache 与元信息（优先 safetensors）。"""
     manifest = None
@@ -245,6 +341,7 @@ def decode_kvcache(
     model,
     chunk_index=None,
     chunk_indices=None,
+    per_layer_chunk_indices=None,
     max_new_tokens=128,
     min_new_tokens=8,
     temperature=0.7,
@@ -252,58 +349,127 @@ def decode_kvcache(
     repetition_penalty=1.1,
     decode_strategy="sample",
     suffix=None,
+    crypto_ctx=None,
 ):
     """加载 KV cache，直接文本解码，跳过视频预处理与编码。
 
     chunk_indices : list[int] | None
         指定只加载哪些 chunk 的 KV（例如 [0, 3, 7]）。
         None 表示加载全部（原有行为）。
-        加载的 chunk 越少，decode 阶段峰值内存越低。
+    per_layer_chunk_indices : list[list[int]] | None
+        ReKV per-layer 独立检索模式。由 select_chunks_per_layer() 生成。
+        提供时优先使用，忽略 chunk_indices 参数。
+        per_layer_chunk_indices[L] = 第 L 层选出的 chunk 列表。
     decode_strategy : str
-        生成策略：
-          - "sample": 采样（temperature/top_p/repetition_penalty 生效）
-          - "greedy": 贪心（忽略 top_p，temperature/repetition_penalty 不生效）
+        "sample" 或 "greedy"。
     suffix : str | None
-        若提供，直接作为 decode 的文本输入，绕过 _build_decode_suffix。
-        适合需要包含选项、格式化 prompt 的场景（如多选题评测）。
+        直接作为 decode 的文本输入，绕过 _build_decode_suffix。
+    crypto_ctx : CryptoContext | None
+        KV cache 解密上下文。
     """
-    kv_cache, metadata = load_kv_cache(
-        kv_cache_path, map_location="cpu",
-        chunk_index=chunk_index, chunk_indices=chunk_indices,
-    )
-    if not kv_cache:
-        raise ValueError("KV cache is empty.")
-
-    model_name = getattr(model.config, "_name_or_path", None)
-    expected_model = metadata.get("model_name_or_path")
-    if expected_model and model_name and expected_model != model_name:
-        raise ValueError(f"Model mismatch: cache={expected_model}, current={model_name}")
-
     device = next(model.parameters()).device
 
-    # ---- 始终加载轻量的 prefix_cache，拼在 chunk KV 之前 ----
-    # prefix_cache 存的是 encode_prefix 文字 token 的 KV（位置 0..P-1）。
-    # chunk shard 存的是视频 visual token 的 delta KV（位置 P+... ）。
-    # 两者拼接后，各段 K/V 向量保留其 encode 时的绝对位置，RoPE 正确。
-    if os.path.isdir(kv_cache_path):
-        prefix_kv, prefix_seq_len = _load_prefix_cache(kv_cache_path, map_location="cpu")
-        if prefix_kv is not None and kv_cache:
-            prefix_kv_dev = tuple((k.to(device), v.to(device)) for k, v in prefix_kv)
-            kv_cache = _concat_kv_segments([prefix_kv_dev, kv_cache])
-            print(f"[decode] Prepended prefix ({prefix_seq_len} tokens) → total KV seq_len={kv_cache[0][0].shape[-2]}")
-        elif prefix_kv is not None:
-            kv_cache = tuple((k.to(device), v.to(device)) for k, v in prefix_kv)
-    else:
-        prefix_seq_len = 0
+    # ── 类型检查：自动识别 per-layer 列表 vs 全局 chunk 列表 ──────────────────
+    # select_chunks()          → List[int]        → 全局模式（分支 B）
+    # select_chunks_per_layer()→ List[List[int]]  → per-layer 模式（分支 A）
+    # 如果用户误把 List[int] 传给 per_layer_chunk_indices，自动降级到分支 B。
+    if per_layer_chunk_indices is not None:
+        if len(per_layer_chunk_indices) == 0:
+            per_layer_chunk_indices = None   # 空列表 → 全局模式
+        elif isinstance(per_layer_chunk_indices[0], int):
+            print(
+                "[decode] WARNING: per_layer_chunk_indices received a flat List[int] "
+                "(looks like output of select_chunks, not select_chunks_per_layer). "
+                "Treating as chunk_indices and falling back to global mode."
+            )
+            chunk_indices = list(per_layer_chunk_indices)
+            per_layer_chunk_indices = None
 
-    kv_cache = move_to_device(kv_cache, device)
+    # ── 分支 A：per-layer 独立检索模式 ────────────────────────────────────
+    if per_layer_chunk_indices is not None:
+        print(f"[decode] Per-layer retrieval mode: {len(per_layer_chunk_indices)} layers")
+
+        # 加载 prefix（所有层共用）
+        prefix_kv, prefix_seq_len = _load_prefix_cache(
+            kv_cache_path, map_location="cpu"
+        ) if os.path.isdir(kv_cache_path) else (None, 0)
+
+        # 逐层加载各自的 chunk KV
+        video_kv, video_seq_len = _assemble_per_layer_kv(
+            kv_cache_path, per_layer_chunk_indices,
+            crypto_ctx=crypto_ctx, map_location="cpu"
+        )
+
+        # 拼 prefix + video，逐层拼接（所有层 prefix 相同）
+        if prefix_kv is not None:
+            prefix_dev = tuple((k.to(device), v.to(device)) for k, v in prefix_kv)
+            video_dev  = tuple((k.to(device), v.to(device)) for k, v in video_kv)
+            kv_cache = _concat_kv_segments([prefix_dev, video_dev])
+            print(f"[decode] prefix={prefix_seq_len} + video={video_seq_len} = "
+                  f"{prefix_seq_len + video_seq_len} tokens per layer")
+        else:
+            kv_cache = move_to_device(video_kv, device)
+            prefix_seq_len = 0
+
+        past_seq_len = kv_cache[0][0].shape[-2]   # 实际加载的 KV 总长
+
+        # per-layer 模式也需要 full_merged_seq_len，确保 Q 位置 > 所有 K 位置
+        # 原因：K 向量保留了 encode 时的绝对位置（post-RoPE baked-in）；
+        # 若 Q < 某 K 位置，相对距离为负，破坏因果注意力 → 模型立即输出 <|im_end|>
+        manifest_path = os.path.join(kv_cache_path, "manifest.json")
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as _f:
+                _manifest = json.load(_f)
+            _common = _manifest.get("common_metadata", {}) or {}
+            full_merged_seq_len_for_pos = int(_common.get("full_merged_seq_len", past_seq_len))
+        except Exception:
+            full_merged_seq_len_for_pos = past_seq_len
+        metadata = {"full_merged_seq_len": full_merged_seq_len_for_pos}
+
+    # ── 分支 B：原有全局 chunk 模式（向后兼容）─────────────────────────────
+    else:
+        kv_cache, metadata = load_kv_cache(
+            kv_cache_path, map_location="cpu",
+            chunk_index=chunk_index, chunk_indices=chunk_indices,
+        )
+        if not kv_cache:
+            raise ValueError("KV cache is empty.")
+
+        model_name = getattr(model.config, "_name_or_path", None)
+        expected_model = metadata.get("model_name_or_path")
+        if expected_model and model_name and expected_model != model_name:
+            raise ValueError(f"Model mismatch: cache={expected_model}, current={model_name}")
+
+        if os.path.isdir(kv_cache_path):
+            prefix_kv, prefix_seq_len = _load_prefix_cache(
+                kv_cache_path, map_location="cpu"
+            )
+            if prefix_kv is not None and kv_cache:
+                prefix_kv_dev = tuple((k.to(device), v.to(device)) for k, v in prefix_kv)
+                kv_cache = _concat_kv_segments([prefix_kv_dev, kv_cache])
+                print(f"[decode] Prepended prefix ({prefix_seq_len} tokens) → "
+                      f"total KV seq_len={kv_cache[0][0].shape[-2]}")
+            elif prefix_kv is not None:
+                kv_cache = tuple((k.to(device), v.to(device)) for k, v in prefix_kv)
+        else:
+            prefix_seq_len = 0
+
+        kv_cache = move_to_device(kv_cache, device)
+        past_seq_len = kv_cache[0][0].shape[-2]
+
     model_past_key_values = _to_model_cache(kv_cache)
 
     suffix = suffix if suffix is not None else _build_decode_suffix(question)
     model_inputs = processor(text=[suffix], return_tensors="pt")
     model_inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in model_inputs.items()}
 
-    past_seq_len = _get_past_seq_len(kv_cache, metadata)
+    # past_seq_len 已在两个分支中分别设置（per-layer 或 全局 chunk 路径）
+    # 这里统一从实际 KV tensor 形状取，确保一致
+    if per_layer_chunk_indices is not None:
+        # per-layer 路径：past_seq_len 已由 _assemble_per_layer_kv 确定
+        pass   # past_seq_len already set above
+    else:
+        past_seq_len = _get_past_seq_len(kv_cache, metadata)
     current_seq_len = model_inputs["input_ids"].shape[1]
     full_attention_mask = torch.ones(
         (model_inputs["input_ids"].shape[0], past_seq_len + current_seq_len),
@@ -312,35 +478,26 @@ def decode_kvcache(
     )
     model_inputs["attention_mask"] = full_attention_mask
 
-    # ---- position_ids：ReKV 连续位置策略 ----
-    # ReKV 论文（ICLR 2025）Section 3 "Positional Encoding"：
-    #   "we do not account for the original positions of the retrieved KV-Caches.
-    #    Instead, we treat these retrieved tokens as regular consecutive tokens."
-    #   "applying standard RoPE to retrieved video tokens leads to better performance."
+    # ---- position_ids ----
+    # 我们的 K 向量是 post-RoPE（encode 时 baked-in 绝对位置）。
+    # Q 必须放在所有 K 位置之后，否则相对距离为负，破坏因果注意力。
     #
-    # 实现：Q 的起始位置 = past_seq_len（实际加载的 KV 长度），而非 full_merged_seq_len。
-    #
-    # 原因：
-    #   - K 向量在 encode 时用 sliding-window，位置范围约 0~15000
-    #   - 若 Q 从 full_merged_seq_len（~50000）出发，Q-K 相对距离 ~49000，
-    #     远超 Qwen2-7B 32K 训练上下文，RoPE 完全分布外
-    #   - 若 Q 从 past_seq_len（~5600）出发，Q-K 相对距离 ~4600，
-    #     完全在训练分布内，与 ReKV 对齐
-    #
-    # 不设 position_ids 时 transformers 从 past_key_values 长度自动推断，效果等价；
-    # 此处显式设置以保证无歧义。
+    # ReKV 原论文用的是 pre-RoPE K + decode 时重新施加连续 RoPE，
+    # 但我们存的是 post-RoPE K，因此不能直接套用 ReKV 的 past_seq_len 策略。
+    # 必须用 full_merged_seq_len（encode 时的完整视频总长）作为 Q 起始位置，
+    # 确保 Q > 所有 K 的 baked-in 绝对位置。
     full_merged_seq_len = int(metadata.get("full_merged_seq_len", past_seq_len))
     position_ids = torch.arange(
-        past_seq_len,
-        past_seq_len + current_seq_len,
+        full_merged_seq_len,
+        full_merged_seq_len + current_seq_len,
         device=device,
         dtype=torch.long,
     ).unsqueeze(0)
     model_inputs["position_ids"] = position_ids
     print(
-        f"[decode] position_ids: start={past_seq_len} (ReKV consecutive strategy)  "
+        f"[decode] position_ids: start={full_merged_seq_len}  "
         f"loaded_kv={past_seq_len}, full_merged={full_merged_seq_len}  "
-        f"Q-K max relative dist ≈ {past_seq_len} (was {full_merged_seq_len} before fix)"
+        f"Q-K max relative dist ≈ {full_merged_seq_len}"
     )
 
     for k, v in model_inputs.items():
@@ -365,8 +522,8 @@ def decode_kvcache(
         generated_token_ids = []
 
         # next_token_pos：下一个待生成 token 的位置（紧接在 prefill 之后）
-        # 与 ReKV 策略一致：基于实际加载的 KV 长度，而非 full_merged_seq_len
-        next_token_pos = past_seq_len + current_seq_len
+        # 与 position_ids 起始位置保持一致，从 full_merged_seq_len 处延伸
+        next_token_pos = full_merged_seq_len + current_seq_len
 
         logits = outputs.logits[:, -1, :]
         if decode_strategy == "greedy":

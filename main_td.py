@@ -6,7 +6,7 @@ import argparse
 from kvcache_generate_td import load_model, load_video, encode_video
 from kvcache_manager_td import KVCacheManager
 from kvcache_retrieve_td import decode_kvcache
-from kvcache_select_td import select_chunks
+from kvcache_select_td import select_chunks, select_chunks_per_layer
 from zhz_hardware_eval_utils import *
 from zhz_model_eval_utils import *
 
@@ -38,6 +38,7 @@ if __name__ == "__main__":
                         help="空间降分辨率：像素面积保留比例（0~1）。"
                              "0 = 不启用。0.5 = 面积缩小至 50%%（长宽各 ×√0.5≈0.707），保留宽高比。"
                              "推荐 0.3~0.7。")
+    # 在目前的模型llava-onevision下，空间剪枝是无效的，因为分辨率不随着输入视频分辨率的变化而变化，而是固定的384*384
 
     # ── 加密参数 ──────────────────────────────────────────────────────────
     parser.add_argument("--encrypt", action="store_true",
@@ -51,7 +52,7 @@ if __name__ == "__main__":
     video_path    = "../data/haimian_7.mp4"
     kv_cache_path = "../data/kv_cache_chunks"
     question      = "Who is in the video, and what are they doing?"
-    encode_prefix = "Please understand the video and be ready to answer the single-choice question based on the video content. "
+    encode_prefix = "You are a helpful assistant. Please understand the video content and prepare to answer single-choice questions."
 
     # ── 构建 PruneContext（encode 侧使用）────────────────────────────────
     prune_ctx = None
@@ -85,7 +86,7 @@ if __name__ == "__main__":
         except Exception as e:
             logger.warning(f"[crypto] Failed to load key: {e}. Encryption disabled.")
 
-    with measure_resources(args.mode, logger=logger, plot_file=args.plot_file) as monitor:
+    with measure_resources(args.mode, logger=logger, plot_file=args.plot_file, plot_lable=False) as monitor:
         # ── 编码阶段 ──────────────────────────────────────────────────────────
         if args.mode in ("encode_decode", "encode"):
 
@@ -93,7 +94,7 @@ if __name__ == "__main__":
             processor, model = load_model(model_path, load_weights=True)
             inject_timing_hook_to_model(model, event_callback=monitor["mark"])
 
-            video = load_video(video_path, sample_fps=1)
+            video = load_video(video_path, sample_fps=0.5)
 
             monitor["mark"]("kvcache_encode_start")
             manager = KVCacheManager(
@@ -106,7 +107,7 @@ if __name__ == "__main__":
                 video=video,
                 processor=processor,
                 model=model,
-                chunk_size=16,
+                chunk_size=1,
                 encode_prefix=encode_prefix,
                 stage_mark=monitor["mark"],
                 kv_cache_dir=kv_cache_path,
@@ -127,9 +128,32 @@ if __name__ == "__main__":
             processor, model = load_model(model_path, load_weights=True)
             inject_timing_hook_to_model(model)
 
+            text_content = f"Question: {question}\nAnswer:"
+            conversation_context = [{
+                "role": "user",
+                "content": [{
+                    "type": "text", "text": text_content
+                }],
+            }]
+            prompt = processor.apply_chat_template(
+                conversation_context,
+                add_generation_prompt = True,
+                tokenize=False,
+            )
+
+            print("======================================================")
+            print(f"decode_select：{args.decode_select}")
+            print("添加chat_template后Prompt为：")
+            print(prompt)
+
             if args.decode_select > 0:
-                decode_chunk_ids = select_chunks(
-                    kv_cache_path, question, processor, model, top_k=args.decode_select,
+                #decode_chunk_ids = select_chunks(
+                decode_chunk_ids = select_chunks_per_layer(
+                    kv_cache_path, 
+                    question, 
+                    processor, 
+                    model, 
+                    top_k=args.decode_select,
                 )
                 logger.info(f"Decoding with top-{args.decode_select} selected chunks.")
             else:
@@ -145,10 +169,11 @@ if __name__ == "__main__":
                 max_new_tokens=32,
                 min_new_tokens=1,
                 temperature=0.0,
-                decode_strategy="greedy",
-                chunk_indices=decode_chunk_ids,
-                suffix=None,
+                decode_strategy="sample",
+                #chunk_indices=decode_chunk_ids,
+                suffix=prompt,
                 crypto_ctx=crypto_ctx,  # ← 自动解密
+                per_layer_chunk_indices = decode_chunk_ids,
             )
 
             print(f"model answer: {answer}")

@@ -28,13 +28,13 @@ run_decode_all(){
         > ../results/logs/${name}.log 2>&1
 }
 
-for encode_window in 128; do
-    for anon_index in 1202 242 713 29 557; do
-#    for anon_index in 1202 242 713 29 557 692 1025 133 686 1231; do
+
+for anon_index in 1202 242 713 29 557 692 1025 133 686 1231; do
 #    for anon_index in 130 359 409 474 507 516 687 1153 0 8; do
-        #echo "Running encode mlvu_index=$anon_index, window=$encode_window"
-        #run_encode $anon_index 256 $encode_window
+    for encode_window in 32 64 77 96 128 160; do
+        echo "Running encode mlvu_index=$anon_index, window=$encode_window"
+        run_encode $anon_index 224 $encode_window
         echo "Running all decode settings mlvu_index=$anon_index, window=$encode_window"
-        run_decode_all $anon_index "16,32,64,128,256,384,0" $encode_window
+        run_decode_all $anon_index "8,16,32,64,128,256,512,0" $encode_window
     done
 done

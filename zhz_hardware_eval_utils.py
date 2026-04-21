@@ -89,7 +89,7 @@ class ResourceMonitor:
 
 
 @contextmanager
-def measure_resources(name="Task", interval=0.1, logger=None, plot_file=None):
+def measure_resources(name="Task", interval=0.1, logger=None, plot_file=None, plot_lable=False):
     """测量代码块的资源使用情况。"""
     if logger is None:
         logger = logging.getLogger(__name__)
@@ -129,11 +129,11 @@ def measure_resources(name="Task", interval=0.1, logger=None, plot_file=None):
                 safe_name = "".join(c for c in name if c.isalnum() or c in ["_", "-"])
                 plot_file = f"resource_usage_{safe_name}_{timestamp}.png"
 
-            plot_resource_usage(results["stats"], plot_file, name)
+            plot_resource_usage(results["stats"], plot_file, name, plot_lable)
             logger.info(f"Resource usage chart saved to: {plot_file}")
 
 
-def plot_resource_usage(stats, output_file, task_name="Task"):
+def plot_resource_usage(stats, output_file, task_name="Task", plot_lable=False):
     """绘制资源使用曲线图（仅 memory 图）。"""
     matplotlib.use("Agg")
 
@@ -169,37 +169,39 @@ def plot_resource_usage(stats, output_file, task_name="Task"):
         verticalalignment="top",
         bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="#d62728"),
     )
+    
+    if plot_lable:
+        # 将所有阶段标线和标签都绘制在 memory 图中
+        events = stats.get("events", [])
 
-    # 将所有阶段标线和标签都绘制在 memory 图中
-    events = stats.get("events", [])
-    for idx, event in enumerate(events):
-        t = event.get("t", 0.0)
-        label = event.get("label", "event")
-        color = "#2cc411"
-        if "prefill" in label:
-            color = "#ab23cd"
-        if "visual" in label:
-            color = "#EDBE33"
-        if "load" in label:
-            color = "#b01318"
-        y = 0.98
-        if  "prefill" in label:
-            y = 0.65
-        if  "visual" in label:
-            y = 0.3
-        ax.axvline(t, color=color, linestyle=":", linewidth=3, alpha=0.8)
+        for idx, event in enumerate(events):
+            t = event.get("t", 0.0)
+            label = event.get("label", "event")
+            color = "#2cc411"
+            if "prefill" in label:
+                color = "#ab23cd"
+            if "visual" in label:
+                color = "#EDBE33"
+            if "load" in label:
+                color = "#b01318"
+            y = 0.98
+            if  "prefill" in label:
+                y = 0.65
+            if  "visual" in label:
+                y = 0.3
+            ax.axvline(t, color=color, linestyle=":", linewidth=3, alpha=0.8)
 
-        ax.text(
-            t,
-            ax.get_ylim()[1] * y,
-            label,
-            rotation=90,
-            fontsize=15,
-            va="top",
-            ha="right",
-            color=color,
-            alpha=0.9,
-        )
+            ax.text(
+                t,
+                ax.get_ylim()[1] * y,
+                label,
+                rotation=90,
+                fontsize=15,
+                va="top",
+                ha="right",
+                color=color,
+                alpha=0.9,
+            )
 
     system_info = get_system_info()
     system_text = (

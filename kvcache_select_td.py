@@ -255,17 +255,104 @@ def select_chunks(
     c_norm = F.normalize(c, dim=2)
     sim = (c_norm * q_norm.unsqueeze(0)).sum(dim=2).mean(dim=1)               # [N]
 
-    print("[select_chunks] Cosine similarities (pre-RoPE, content-based):")
-    for i in range(0, n_chunks, 10):
-        line = " ".join(
-            f"{idx:3d}:{s:.4f}"
-            for idx, s in zip(all_indices[i:i+10], sim[i:i+10].tolist())
-        )
-        print(f"  {line}")
-
     # 直接取 top-k（离散，无连续约束）
     topk_local = torch.topk(sim, k=top_k, largest=True).indices.tolist()
     result = sorted(all_indices[i] for i in topk_local)
 
-    print(f"[select_chunks] Selected chunks: {result} (top_k={top_k})")
+    print(f"[select_chunks] mode=global  top_k={top_k}  selected={result}")
     return result
+
+# ---------------------------------------------------------------------------
+# Per-layer 独立检索（ReKV Internal Retrieval 的完整实现）
+# ---------------------------------------------------------------------------
+
+def select_chunks_per_layer(
+    kv_cache_dir: str,
+    question: str,
+    processor,
+    model,
+    top_k: int = 8,
+) -> List[List[int]]:
+    """
+    ReKV ICLR'25 Section 3 Internal Retrieval 的直接实现：
+    每个 attention layer 用自己的 Q 和 K 向量独立选出 top_k 个最相关 chunk，
+    不同层的选择结果可以（且通常会）不同。
+
+    原论文原文：
+        "internal retrieval [...] operates independently within each self-attention
+         layer, allowing different layers to retrieve different video blocks.
+         This allows for a broader capture of video context."
+        "The average of the key vectors of a frame is computed as its representative
+         frame vector [...] concatenated across heads into a single vector."
+
+    与 select_chunks() 的区别
+    -------------------------
+    select_chunks()       : mean over layers → 单一全局 chunk 选择（所有层共享）
+    select_chunks_per_layer: per-layer 独立 → List[L] 每层各自的 top_k chunk 列表
+
+    参数
+    ----
+    top_k : 每层各自选 top_k 个 chunk（不同层可能不同，但数目相同）
+
+    返回
+    ----
+    per_layer_chunk_ids : List[List[int]]
+        长度 = 模型层数（如 28）
+        per_layer_chunk_ids[L] = 第 L 层选出的 chunk_index 列表（升序）
+
+    使用方式
+    --------
+    per_layer_ids = select_chunks_per_layer(kv_dir, q, proc, model, top_k=8)
+    answer = decode_kvcache(..., per_layer_chunk_indices=per_layer_ids)
+    """
+    all_indices, chunk_layer_key_vecs = _load_chunk_layer_key_vecs(kv_cache_dir)
+    # chunk_layer_key_vecs: [N, L, Hkv, D]
+    n_chunks = len(all_indices)
+
+    if n_chunks == 0:
+        return []
+    if top_k >= n_chunks:
+        print(f"[select_per_layer] top_k={top_k} >= total chunks={n_chunks}, returning all for every layer.")
+        return [list(all_indices) for _ in range(chunk_layer_key_vecs.shape[1])]
+
+    # Q 向量：[L, Hkv, D]（pre-RoPE，与 retrieval_index 的 K 向量对齐）
+    query_layer_vecs = _compute_query_vec(question, processor, model)  # [L, Hkv, D]
+    n_layers = query_layer_vecs.shape[0]
+
+    # ── per-layer cosine similarity ──────────────────────────────────────
+    # q: [L, D']   where D' = Hkv × D（flatten heads）
+    # c: [N, L, D']
+    D_prime = query_layer_vecs.shape[1] * query_layer_vecs.shape[2]
+    q = query_layer_vecs.reshape(n_layers, D_prime)               # [L, D']
+    c = chunk_layer_key_vecs.reshape(n_chunks, n_layers, D_prime) # [N, L, D']
+
+    q_norm = F.normalize(q, dim=1)                                # [L, D']
+    c_norm = F.normalize(c, dim=2)                                # [N, L, D']
+
+    # sim_per_layer[n, l] = cosine(chunk_n, layer_l)
+    # c_norm: [N, L, D']  q_norm: [L, D'] → broadcast → element-wise → sum over D' → [N, L]
+    sim_per_layer = (c_norm * q_norm.unsqueeze(0)).sum(dim=2)     # [N, L]
+
+    # ── 逐层独立 top-k 选择 ───────────────────────────────────────────────
+    per_layer_chunk_ids = []
+    for L_idx in range(n_layers):
+        layer_sim = sim_per_layer[:, L_idx]  # [N]
+        k = min(top_k, n_chunks)
+        topk_local = torch.topk(layer_sim, k=k, largest=True).indices.tolist()
+        layer_result = sorted(all_indices[i] for i in topk_local)
+        per_layer_chunk_ids.append(layer_result)
+
+    # ── 打印：每层各自选中了哪些 chunk（验证 per-layer 检索确实各层不同）
+    all_selected = [set(ids) for ids in per_layer_chunk_ids]
+    union_count = len(set().union(*all_selected))
+    inter_count = len(set.intersection(*all_selected)) if all_selected else 0
+    print(
+        f"[select_per_layer] mode=per-layer  top_k={top_k}  "
+        f"union_chunks={union_count} (across all layers)  "
+        f"intersection_chunks={inter_count} (in every layer)"
+    )
+    # 逐层显示选中的 chunk 列表，每层一行
+    for L_idx in range(n_layers):
+        print(f"  L{L_idx:02d}: {per_layer_chunk_ids[L_idx]}")
+
+    return per_layer_chunk_ids

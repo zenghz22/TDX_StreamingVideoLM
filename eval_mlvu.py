@@ -10,7 +10,7 @@ import re
 from kvcache_generate_td import load_model, load_video, encode_video
 from kvcache_manager_td import KVCacheManager
 from kvcache_retrieve_td import decode_kvcache
-from kvcache_select_td import select_chunks
+from kvcache_select_td import select_chunks, select_chunks_per_layer
 from zhz_hardware_eval_utils import *
 from zhz_model_eval_utils import *
 
@@ -28,6 +28,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TD-side video encoding and decoding")
     parser.add_argument("--mode", type=str, default="encode_decode",choices=["encode_decode","decode","encode"])
     parser.add_argument("--plot_file", type=str, default=None)
+    parser.add_argument("--chunk_size", type=int, default=1)
     parser.add_argument("--encode_memory", type=int, default=64)
     parser.add_argument("--encode_window", type=int, default=0)
     parser.add_argument("--decode_select", type=str, default="0",
@@ -54,7 +55,7 @@ if __name__ == "__main__":
     
     # ── 编码阶段 ──────────────────────────────────────────────────────
     if args.mode == "encode_decode" or args.mode == "encode":
-        with measure_resources("Encode", logger=logger, plot_file=args.plot_file) as monitor:
+        with measure_resources("Encode", logger=logger, plot_file=args.plot_file, plot_lable=False) as monitor:
             #'''
             processor, model = load_model(model_path, load_weights=True)
             inject_timing_hook_to_model(model, event_callback=monitor["mark"])
@@ -71,7 +72,7 @@ if __name__ == "__main__":
                 video = video,
                 processor = processor,
                 model = model,
-                chunk_size = 1,
+                chunk_size = args.chunk_size,
                 encode_prefix=encode_prefix,
                 stage_mark=monitor["mark"],
                 kv_cache_dir=kv_cache_path,
@@ -90,7 +91,7 @@ if __name__ == "__main__":
     # 每次 decode_kvcache 调用结束后 past_key_values 是局部变量自然释放；
     # 每个 decode_select 设置之间只需 reset hooks + gc，无需重载模型。
     if args.mode == "encode_decode" or args.mode == "decode":
-        with measure_resources("Decode", logger=logger, plot_file=args.plot_file) as monitor:
+        with measure_resources("Decode", logger=logger, plot_file=args.plot_file, plot_lable=False) as monitor:
 
             monitor["mark"]("load_model_decode")
             processor, model = load_model(model_path, load_weights=True)
@@ -132,7 +133,8 @@ if __name__ == "__main__":
 
                     if decode_select > 0:
                         top_k = decode_select
-                        decode_chunk_ids = select_chunks(
+                        #decode_chunk_ids = select_chunks(
+                        decode_chunk_ids = select_chunks_per_layer(
                             kv_cache_path,
                             question,
                             processor,
@@ -154,7 +156,8 @@ if __name__ == "__main__":
                         min_new_tokens=1,
                         temperature=0.0,
                         decode_strategy="sample",
-                        chunk_indices=decode_chunk_ids,
+                        #chunk_indices=decode_chunk_ids,
+                        per_layer_chunk_indices = decode_chunk_ids,
                         suffix=prompt,
                     )
                     
