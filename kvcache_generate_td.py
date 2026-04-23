@@ -11,6 +11,7 @@ from decord import VideoReader, cpu
 from safetensors.torch import save_file
 from transformers import LlavaOnevisionForConditionalGeneration as LlavaOV
 from transformers import LlavaOnevisionProcessor
+from kvpack_mmap_td import KVPackWriter, KVPackReader
 
 # 统一前缀：编码和解码都基于同一语境，避免 KV 与后续文本提示错位。
 VIDEO_PLACEHOLDER = "<video>"
@@ -222,18 +223,16 @@ def encode_video(
     encode_prefix=None,
     stage_mark=None,
     kv_cache_dir=None,
-    manager=None,           # 可选：KVCacheManager 实例
     prune_ctx=None,         # 可选：video_token_prune_td.PruneContext
     crypto_ctx=None,        # 可选：kvcache_crypto_td.CryptoContext
+    max_in_memory: int = 64,
+    window_size: Optional[int] = None,
 ):
     """
     将视频分块编码成 KV cache。
 
     Parameters
     ----------
-    manager : KVCacheManager | None
-        若提供，则由 manager 负责内存调度（LRU + 可选滑动窗口）。
-        若为 None，退回原有行为（全量 KV 常驻内存）。
     prune_ctx : PruneContext | None
         视觉 token 剪枝上下文（video_token_prune_td.PruneContext）。
         None 时不剪枝。支持两级：帧级时序去冗余 + ViT 输出后空间剪枝。
@@ -244,19 +243,11 @@ def encode_video(
 
     行为说明
     --------
-    无 manager（原有行为）
-        每次 forward 传入全量累积 KV，内存随 chunk 数线性增长。
-
-    有 manager，window_size=None（全局注意力 + LRU）
-        每次 forward 传入全量历史 KV，但超出 max_in_memory 的 chunk
-        会被 LRU evict 到磁盘，需要时再 reload。适合 chunk 数量少的情况。
-
-    有 manager，window_size=W（滑动窗口）
-        每次 forward 只传入最近 W 个 chunk 的 KV，窗口外的 chunk 永久驱逐。
-        内存严格限制为 O(W)，但远程上下文不可见。
-        Position IDs 通过 language_model 上的 pre-hook 修正（确保 RoPE 正确）。
+    本函数已移除旧的 safetensors manager 调度体系，统一采用 kvpack_mmap_v1：
+      - 按 frame×layer block 追加写入 kvpack.bin
+      - 编码阶段 past_kv 由「内存缓存 + mmap 回读」拼装
+      - window_size 控制仅保留最近 W 帧上下文（None 表示全历史）
     """
-    kv_cache = []            # 原有模式下的全量累积 KV
     num_frames = video.shape[0]
     num_chunks = (num_frames + chunk_size - 1) // chunk_size
     chunk_records = []
@@ -265,17 +256,13 @@ def encode_video(
     retrieval_layer_key_vecs = []
     retrieval_summary_vecs = []
 
-    # 安装 sliding window position hook（仅 manager + window_size 模式）
-    use_manager = manager is not None and model is not None
-    if use_manager and manager.window_size is not None:
-        manager.install_position_hook(model.language_model)
-        print(
-            f"[encode_video] Sliding window mode: window_size={manager.window_size}, "
-            f"max_in_memory={manager.max_in_memory}"
-        )
-
+    pack_writer = None
     if kv_cache_dir is not None:
         os.makedirs(kv_cache_dir, exist_ok=True)
+        pack_writer = KVPackWriter(kv_cache_dir)
+    # 帧级缓存：frame_idx -> tuple[L](k,v)
+    frame_cache = {}
+    frame_order = []
 
     # ---- 前缀单独编码 ----
     # encode_prefix 文字 token 的 KV 存为 prefix_cache.safetensors；
@@ -288,9 +275,7 @@ def encode_video(
             encode_prefix, processor, model, kv_cache_dir, device_tmp,
             crypto_ctx=crypto_ctx,
         )
-        # manager 的 _full_merged_seq_len 从 prefix_seq_len 开始累积
-        if use_manager and prefix_seq_len > 0:
-            manager._full_merged_seq_len = prefix_seq_len
+    full_merged_seq_len = int(prefix_seq_len)
 
     # ---- 剪枝说明 ────────────────────────────────────────────────────────
     # Level 0 temporal: 在 processor 之前减少帧数（有效）
@@ -308,34 +293,27 @@ def encode_video(
 
             # ---- Level-0 帧级时序去冗余（在 processor 之前，纯 numpy）----
             if prune_ctx is not None:
-                try:
-                    from video_prune import temporal_filter_chunk
-                    chunk = temporal_filter_chunk(chunk, prune_ctx, chunk_idx=i)
-                    if len(chunk) == 0:
-                        print(f"[prune] chunk {i}: all frames filtered, skipping.")
-                        continue
-                    if len(chunk) != frames_before_prune:
-                        print(
-                            f"[prune:temporal] chunk {i}: "
-                            f"{frames_before_prune} → {len(chunk)} frames "
-                            f"({len(chunk)/frames_before_prune:.0%} kept)"
-                        )
-                except ImportError:
-                    pass
+                from video_prune import temporal_filter_chunk
+                chunk = temporal_filter_chunk(chunk, prune_ctx, chunk_idx=i)
+                if len(chunk) == 0:
+                    print(f"[prune] chunk {i}: all frames filtered, skipping.")
+                    continue
+                if len(chunk) != frames_before_prune:
+                    print(
+                        f"[prune:temporal] chunk {i}: "
+                        f"{frames_before_prune} → {len(chunk)} frames "
+                        f"({len(chunk)/frames_before_prune:.0%} kept)"
+                    )
 
             # ---- Level-1 像素级降分辨率（在 processor 之前，Pillow resize）----
             if prune_ctx is not None:
-                try:
-                    from video_prune import spatial_downscale_chunk
-                    chunk = spatial_downscale_chunk(chunk, prune_ctx, chunk_idx=i)
-                except ImportError:
-                    pass
+                from video_prune import spatial_downscale_chunk
+                chunk = spatial_downscale_chunk(chunk, prune_ctx, chunk_idx=i)
 
             pixel_values = processor.video_processor(chunk, return_tensors="pt").pixel_values_videos.to("cpu")
             print(f"[chunk {i}] pixel_values_videos shape: {tuple(pixel_values.shape)}")
 
             if model is None:
-                kv_cache.append({"chunk_index": i, "pixel_values_shape": tuple(pixel_values.shape)})
                 continue
 
             # 所有 chunk 都只用 VIDEO_PLACEHOLDER；
@@ -370,29 +348,42 @@ def encode_video(
                 merged = _cat_kv([pkv, base_kv])
                 return (merged, int(merged[0][0].shape[-2]))
 
-            if use_manager:
-                # manager 模式：获取窗口（或全量）历史 KV，再拼 prefix
-                window_kv, window_seq_len = manager.get_past_kv_for_forward(i)
-                past_kv, past_kv_seq_len = _prepend_prefix(window_kv, window_seq_len)
-                current_text_len = model_inputs["input_ids"].shape[1]
-                if past_kv_seq_len > 0:
-                    model_inputs["attention_mask"] = torch.ones(
-                        (model_inputs["input_ids"].shape[0], past_kv_seq_len + current_text_len),
-                        dtype=model_inputs["attention_mask"].dtype,
-                        device=device,
-                    )
-            else:
-                # 原有模式：全量累积 KV + prefix
-                base_kv = kv_cache if kv_cache else None
-                base_seq = _get_cache_seq_len(kv_cache)
-                past_kv, past_kv_seq_len = _prepend_prefix(base_kv, base_seq)
-                current_text_len = model_inputs["input_ids"].shape[1]
-                if past_kv_seq_len > 0:
-                    model_inputs["attention_mask"] = torch.ones(
-                        (model_inputs["input_ids"].shape[0], past_kv_seq_len + current_text_len),
-                        dtype=model_inputs["attention_mask"].dtype,
-                        device=device,
-                    )
+            # 构建需要的历史帧集合
+            history_frames = list(range(i))
+            if window_size is not None and window_size > 0:
+                history_frames = history_frames[-int(window_size):]
+            # 尝试从内存缓存取，不足时从 mmap pack 回读
+            base_kv = None
+            if history_frames:
+                segments = []
+                miss_frames = [fi for fi in history_frames if fi not in frame_cache]
+                if miss_frames and kv_cache_dir is not None:
+                    reader = KVPackReader(kv_cache_dir)
+                    try:
+                        n_layers = int(common_metadata.get("num_layers", 0))
+                        if n_layers <= 0:
+                            n_layers = getattr(model.config, "num_hidden_layers", 0)
+                        for fi in miss_frames:
+                            per_layer = []
+                            for li in range(n_layers):
+                                k, v, _ = reader.read_layer_frame(li, fi, map_location="cpu")
+                                per_layer.append((k, v))
+                            frame_cache[fi] = tuple(per_layer)
+                    finally:
+                        reader.close()
+                for fi in history_frames:
+                    segments.append(frame_cache[fi])
+                base_kv = _cat_kv(segments) if segments else None
+
+            base_seq = _get_cache_seq_len(base_kv) if base_kv is not None else 0
+            past_kv, past_kv_seq_len = _prepend_prefix(base_kv, base_seq)
+            current_text_len = model_inputs["input_ids"].shape[1]
+            if past_kv_seq_len > 0:
+                model_inputs["attention_mask"] = torch.ones(
+                    (model_inputs["input_ids"].shape[0], past_kv_seq_len + current_text_len),
+                    dtype=model_inputs["attention_mask"].dtype,
+                    device=device,
+                )
 
             print(f"[chunk {i}] encode_text: {repr(encode_text)}")
             print(f"[chunk {i}] past_kv_seq_len (passed to model): {past_kv_seq_len}")
@@ -443,10 +434,6 @@ def encode_video(
                 _h.remove()
             _hook_handles_k.clear()
 
-            # position hook 用完立即关闭（避免影响后续操作）
-            if use_manager:
-                manager.deactivate_position_hook()
-
             full_kv_after = outputs.past_key_values
 
             # ----------------------------------------------------------------
@@ -467,14 +454,11 @@ def encode_video(
                 delta_seq_len = int(delta_kv[0][0].shape[-2])
 
                 # ---- chunk summary vector（pre-RoPE K，供 select 检索）----
-                if _pre_rope_k_layers:
-                    chunk_layer_key_vec = torch.stack(_pre_rope_k_layers, dim=0).float()  # [L, Hkv, D]
-                else:
-                    # fallback: post-RoPE K mean（hook 未捕获时退化）
-                    k_means = []
-                    for layer_k, _ in delta_kv:
-                        k_means.append(layer_k[0].mean(dim=1).float())
-                    chunk_layer_key_vec = torch.stack(k_means, dim=0).float()
+                if not _pre_rope_k_layers:
+                    raise RuntimeError(
+                        f"[chunk {i}] failed to capture pre-RoPE K vectors; aborting in strict mode."
+                    )
+                chunk_layer_key_vec = torch.stack(_pre_rope_k_layers, dim=0).float()  # [L, Hkv, D]
                 _pre_rope_k_layers.clear()
 
                 chunk_summary_vec = chunk_layer_key_vec.mean(dim=0).flatten().float()
@@ -483,8 +467,7 @@ def encode_video(
                 print(f"[chunk {i}] delta_seq_len (this chunk merged): {delta_seq_len}")
                 print(f"[chunk {i}] summary_vec shape: {tuple(chunk_summary_vec.shape)}")
 
-                if use_manager:
-                    manager.update_full_merged_seq_len(delta_seq_len)
+                full_merged_seq_len += delta_seq_len
 
             else:
                 delta_kv = None
@@ -499,114 +482,63 @@ def encode_video(
             # past_kv      → 本轮传给 model 的窗口/全量 KV concat 结果
             # model_inputs → 含 pixel_values 等大型 tensor
             # ----------------------------------------------------------------
-            # 原有模式：更新全量 kv_cache（必须先于 full_kv_after 释放）
-            if not use_manager:
-                kv_cache = full_kv_after
-
             # ----------------------------------------------------------------
             # 保存 delta 到磁盘 & 更新状态
             # ----------------------------------------------------------------
             if kv_cache_dir is not None and delta_kv is not None:
-                shard_file = f"chunk_{i:05d}.safetensors"
-                shard_path = os.path.join(kv_cache_dir, shard_file)
-
-                # 保存本 chunk 的 delta KV
-                shard_metadata = save_kv_cache(
-                    delta_kv,
-                    shard_path,
-                    model=model,
-                    extra_metadata={
-                        "encode_prefix": encode_prefix,
-                        "chunk_index": i,
-                        "chunk_size": chunk_size,
-                        "num_frames": int(num_frames),
-                        "is_delta_chunk": True,
-                        "seq_start": int(past_kv_seq_len),
-                        "seq_end": int(full_kv_seq_len),
-                        "window_size": manager.window_size if use_manager else None,
-                        "max_in_memory": manager.max_in_memory if use_manager else None,
-                    },
-                )
-
-                # ---- 加密 chunk shard（可选）----
-                if crypto_ctx is not None:
-                    crypto_ctx.maybe_encrypt_after_save(
-                        shard_path,
-                        chunk_index=i,
-                        seq_start=int(past_kv_seq_len),
-                        seq_end=int(full_kv_seq_len),
-                        chunk_size=chunk_size,
-                        num_frames=int(num_frames),
-                        model_name=str(shard_metadata.get("model_name_or_path", "")),
-                        prefix_text=str(encode_prefix or ""),
-                    )
-
                 if not common_metadata:
                     common_metadata = {
                         "encode_prefix": encode_prefix,
                         "chunk_size": chunk_size,
                         "num_frames": int(num_frames),
-                        "model_name_or_path": shard_metadata.get("model_name_or_path"),
-                        "window_size": manager.window_size if use_manager else None,
+                        "num_layers": len(delta_kv),
+                        "model_name_or_path": getattr(model.config, "_name_or_path", None),
+                        "window_size": window_size,
+                        "storage_format": "kvpack_mmap_v1",
                     }
 
-                chunk_records.append(
-                    {
-                        "chunk_index": i,
-                        "file": shard_file,
-                        "delta_seq_len": delta_seq_len,
-                        "seq_start": int(past_kv_seq_len),
-                        "seq_end": int(full_kv_seq_len),
-                        "past_seq_len": shard_metadata.get("past_seq_len"),
-                        "layer0_key_shape": shard_metadata.get("layer0_key_shape"),
-                        # ReKV-style summary vector：跨层 K 均值，用于 prompt-aware 检索
-                        #"summary_vec": chunk_summary_vec.tolist() if chunk_summary_vec is not None else None,
-                    }
-                )
+                # layer-frame 粒度落盘：每个 frame chunk 的每一层单独一个 block
+                for layer_idx, (layer_k, layer_v) in enumerate(delta_kv):
+                    rec = pack_writer.append_block(
+                        frame_index=i,
+                        layer_index=layer_idx,
+                        seq_start=int(past_kv_seq_len),
+                        seq_end=int(full_kv_seq_len),
+                        key_tensor=layer_k,
+                        value_tensor=layer_v,
+                    )
+                    rec["chunk_index"] = int(i)
+                    rec["block_index"] = len(chunk_records)
+                    rec["delta_seq_len"] = int(delta_seq_len)
+                    chunk_records.append(rec)
+
                 retrieval_chunk_indices.append(i)
                 retrieval_layer_key_vecs.append(chunk_layer_key_vec.cpu().contiguous())
                 retrieval_summary_vecs.append(chunk_summary_vec.cpu().contiguous())
-
-                # 注册到 manager（manager 负责内存调度）
-                if use_manager:
-                    manager.register_chunk(
-                        chunk_idx=i,
-                        file_name=shard_file,
-                        delta_kv=delta_kv,
-                        seq_start=int(past_kv_seq_len),
-                        seq_end=int(full_kv_seq_len),
-                    )
+                frame_cache[i] = tuple((k.cpu().contiguous(), v.cpu().contiguous()) for k, v in delta_kv)
+                frame_order.append(i)
+                while len(frame_order) > max_in_memory:
+                    old = frame_order.pop(0)
+                    if old in frame_cache:
+                        del frame_cache[old]
 
             del outputs, full_kv_after
-            if use_manager and past_kv is not None:
+            if past_kv is not None:
                 del past_kv
             del model_inputs, pixel_values
             gc.collect()
 
-            # 打印 manager 状态（便于调试）
-            if use_manager:
-                status = manager.memory_status()
-                print(
-                    f"[chunk {i}] Manager: in_memory={status['in_memory']}, "
-                    f"full_merged_seq_len={status['full_merged_seq_len']}"
-                )
-
     finally:
-        # 无论是否发生异常，都清理 position hook
-        if use_manager and manager.window_size is not None:
-            manager.remove_position_hook()
         if prune_ctx is not None and prune_ctx.log_stats:
             print(prune_ctx.summary())
 
     if kv_cache_dir is not None:
         # 把真实的 full_merged_seq_len 写入 common_metadata，
         # retrieve 侧直接读取，无需从 delta_seq_len 反推。
-        if use_manager:
-            common_metadata["full_merged_seq_len"] = manager._full_merged_seq_len
-        else:
-            # 无 manager 时，全量模式下 full_merged_seq_len = 最后一个 chunk 的 seq_end
-            if chunk_records:
-                common_metadata["full_merged_seq_len"] = chunk_records[-1]["seq_end"]
+        common_metadata["full_merged_seq_len"] = int(full_merged_seq_len)
+        if pack_writer is not None:
+            pack_writer.write_index(common_metadata)
+            pack_writer.close()
         _write_chunk_manifest(kv_cache_dir, chunk_records, common_metadata)
         _write_retrieval_index(
             kv_cache_dir,
@@ -616,9 +548,4 @@ def encode_video(
             common_metadata,
         )
 
-    # manager 模式下返回 None（KV 由 manager 管理，不在内存中累积）
-    if use_manager:
-        manager.print_stats()
-        return None
-
-    return kv_cache
+    return None

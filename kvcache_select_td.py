@@ -55,7 +55,7 @@ def _load_manifest_chunks(kv_cache_dir: str):
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
-    chunks = sorted(manifest.get("chunks", []), key=lambda c: int(c["chunk_index"]))
+    chunks = sorted(manifest.get("chunks", []), key=lambda c: int(c.get("chunk_index", c.get("frame_index", -1))))
     if not chunks:
         raise ValueError("No chunk records in manifest.")
 
@@ -71,32 +71,18 @@ def _load_chunk_layer_key_vecs(kv_cache_dir: str):
     chunk_indices : List[int]
     layer_key_vecs: torch.Tensor  [N, L, Hkv, D]
     """
-    from kvcache_retrieve_td import _load_single_safetensors_kv
-
-    # 优先读取 encode 阶段写好的轻量检索索引，避免逐 shard 扫描
+    # 严格模式：必须使用 encode 阶段写好的轻量检索索引
     index_path = os.path.join(kv_cache_dir, "retrieval_index.safetensors")
-    if os.path.exists(index_path):
-        with safe_open(index_path, framework="pt", device="cpu") as f:
-            if "chunk_indices" in f.keys() and "layer_key_vecs" in f.keys():
-                chunk_indices = [int(v) for v in f.get_tensor("chunk_indices").tolist()]
-                layer_key_vecs = f.get_tensor("layer_key_vecs").float()
-                return chunk_indices, layer_key_vecs
-
-    chunks = _load_manifest_chunks(kv_cache_dir)
-    chunk_indices = []
-    layer_vecs = []
-    for c in chunks:
-        chunk_idx = int(c["chunk_index"])
-        shard_path = os.path.join(kv_cache_dir, c["file"])
-        shard_kv, _ = _load_single_safetensors_kv(shard_path, map_location="cpu")
-        # shard_kv: tuple[L] of (k,v), k shape=[B,Hkv,T,D]
-        per_layer = []
-        for layer_k, _ in shard_kv:
-            per_layer.append(layer_k[0].mean(dim=1).float())  # [Hkv, D]
-        chunk_indices.append(chunk_idx)
-        layer_vecs.append(torch.stack(per_layer, dim=0))      # [L, Hkv, D]
-
-    return chunk_indices, torch.stack(layer_vecs, dim=0)      # [N, L, Hkv, D]
+    if not os.path.exists(index_path):
+        raise FileNotFoundError(
+            f"retrieval_index.safetensors not found in {kv_cache_dir}; strict mode forbids fallback."
+        )
+    with safe_open(index_path, framework="pt", device="cpu") as f:
+        if "chunk_indices" not in f.keys() or "layer_key_vecs" not in f.keys():
+            raise KeyError("retrieval_index.safetensors missing required tensors: chunk_indices/layer_key_vecs")
+        chunk_indices = [int(v) for v in f.get_tensor("chunk_indices").tolist()]
+        layer_key_vecs = f.get_tensor("layer_key_vecs").float()
+        return chunk_indices, layer_key_vecs
 
 
 # ---------------------------------------------------------------------------
