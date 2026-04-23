@@ -293,28 +293,22 @@ def encode_video(
 
             # ---- Level-0 帧级时序去冗余（在 processor 之前，纯 numpy）----
             if prune_ctx is not None:
-                try:
-                    from video_prune import temporal_filter_chunk
-                    chunk = temporal_filter_chunk(chunk, prune_ctx, chunk_idx=i)
-                    if len(chunk) == 0:
-                        print(f"[prune] chunk {i}: all frames filtered, skipping.")
-                        continue
-                    if len(chunk) != frames_before_prune:
-                        print(
-                            f"[prune:temporal] chunk {i}: "
-                            f"{frames_before_prune} → {len(chunk)} frames "
-                            f"({len(chunk)/frames_before_prune:.0%} kept)"
-                        )
-                except ImportError:
-                    pass
+                from video_prune import temporal_filter_chunk
+                chunk = temporal_filter_chunk(chunk, prune_ctx, chunk_idx=i)
+                if len(chunk) == 0:
+                    print(f"[prune] chunk {i}: all frames filtered, skipping.")
+                    continue
+                if len(chunk) != frames_before_prune:
+                    print(
+                        f"[prune:temporal] chunk {i}: "
+                        f"{frames_before_prune} → {len(chunk)} frames "
+                        f"({len(chunk)/frames_before_prune:.0%} kept)"
+                    )
 
             # ---- Level-1 像素级降分辨率（在 processor 之前，Pillow resize）----
             if prune_ctx is not None:
-                try:
-                    from video_prune import spatial_downscale_chunk
-                    chunk = spatial_downscale_chunk(chunk, prune_ctx, chunk_idx=i)
-                except ImportError:
-                    pass
+                from video_prune import spatial_downscale_chunk
+                chunk = spatial_downscale_chunk(chunk, prune_ctx, chunk_idx=i)
 
             pixel_values = processor.video_processor(chunk, return_tensors="pt").pixel_values_videos.to("cpu")
             print(f"[chunk {i}] pixel_values_videos shape: {tuple(pixel_values.shape)}")
@@ -460,14 +454,11 @@ def encode_video(
                 delta_seq_len = int(delta_kv[0][0].shape[-2])
 
                 # ---- chunk summary vector（pre-RoPE K，供 select 检索）----
-                if _pre_rope_k_layers:
-                    chunk_layer_key_vec = torch.stack(_pre_rope_k_layers, dim=0).float()  # [L, Hkv, D]
-                else:
-                    # fallback: post-RoPE K mean（hook 未捕获时退化）
-                    k_means = []
-                    for layer_k, _ in delta_kv:
-                        k_means.append(layer_k[0].mean(dim=1).float())
-                    chunk_layer_key_vec = torch.stack(k_means, dim=0).float()
+                if not _pre_rope_k_layers:
+                    raise RuntimeError(
+                        f"[chunk {i}] failed to capture pre-RoPE K vectors; aborting in strict mode."
+                    )
+                chunk_layer_key_vec = torch.stack(_pre_rope_k_layers, dim=0).float()  # [L, Hkv, D]
                 _pre_rope_k_layers.clear()
 
                 chunk_summary_vec = chunk_layer_key_vec.mean(dim=0).flatten().float()

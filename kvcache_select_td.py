@@ -72,35 +72,18 @@ def _load_chunk_layer_key_vecs(kv_cache_dir: str):
     chunk_indices : List[int]
     layer_key_vecs: torch.Tensor  [N, L, Hkv, D]
     """
-    # 优先读取 encode 阶段写好的轻量检索索引，避免逐 shard 扫描
+    # 严格模式：必须使用 encode 阶段写好的轻量检索索引
     index_path = os.path.join(kv_cache_dir, "retrieval_index.safetensors")
-    if os.path.exists(index_path):
-        with safe_open(index_path, framework="pt", device="cpu") as f:
-            if "chunk_indices" in f.keys() and "layer_key_vecs" in f.keys():
-                chunk_indices = [int(v) for v in f.get_tensor("chunk_indices").tolist()]
-                layer_key_vecs = f.get_tensor("layer_key_vecs").float()
-                return chunk_indices, layer_key_vecs
-
-    if not has_kvpack(kv_cache_dir):
+    if not os.path.exists(index_path):
         raise FileNotFoundError(
-            f"Only kvpack_mmap_v1 is supported now; kvpack_index.json not found in {kv_cache_dir}"
+            f"retrieval_index.safetensors not found in {kv_cache_dir}; strict mode forbids fallback."
         )
-    reader = KVPackReader(kv_cache_dir)
-    try:
-        frame_ids = sorted(reader.frames.keys())
-        n_layers = int(reader.common_metadata.get("num_layers", 0))
-        if n_layers <= 0:
-            n_layers = max((l for l, _ in reader.by_layer_frame.keys()), default=-1) + 1
-        layer_vecs = []
-        for fi in frame_ids:
-            per_layer = []
-            for li in range(n_layers):
-                k, _, _ = reader.read_layer_frame(li, fi, map_location="cpu")
-                per_layer.append(k[0].mean(dim=1).float())  # [Hkv, D]
-            layer_vecs.append(torch.stack(per_layer, dim=0))
-        return frame_ids, torch.stack(layer_vecs, dim=0)
-    finally:
-        reader.close()
+    with safe_open(index_path, framework="pt", device="cpu") as f:
+        if "chunk_indices" not in f.keys() or "layer_key_vecs" not in f.keys():
+            raise KeyError("retrieval_index.safetensors missing required tensors: chunk_indices/layer_key_vecs")
+        chunk_indices = [int(v) for v in f.get_tensor("chunk_indices").tolist()]
+        layer_key_vecs = f.get_tensor("layer_key_vecs").float()
+        return chunk_indices, layer_key_vecs
 
 
 # ---------------------------------------------------------------------------

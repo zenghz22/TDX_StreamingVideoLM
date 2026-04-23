@@ -273,7 +273,7 @@ def _load_prefix_cache(kv_cache_dir: str, map_location: str = "cpu"):
     """
     prefix_path = os.path.join(kv_cache_dir, "prefix_cache.safetensors")
     if not os.path.exists(prefix_path):
-        return None, 0
+        raise FileNotFoundError(f"prefix_cache.safetensors not found in {kv_cache_dir}")
     prefix_kv, meta = _load_single_safetensors_kv(prefix_path, map_location=map_location)
     prefix_seq_len = int(prefix_kv[0][0].shape[-2]) if prefix_kv else 0
     print(f"[load_prefix_cache] Loaded prefix KV: {prefix_seq_len} tokens from {prefix_path}")
@@ -349,13 +349,10 @@ def decode_kvcache(
         if len(per_layer_chunk_indices) == 0:
             per_layer_chunk_indices = None   # 空列表 → 全局模式
         elif isinstance(per_layer_chunk_indices[0], int):
-            print(
-                "[decode] WARNING: per_layer_chunk_indices received a flat List[int] "
-                "(looks like output of select_chunks, not select_chunks_per_layer). "
-                "Treating as chunk_indices and falling back to global mode."
+            raise TypeError(
+                "per_layer_chunk_indices must be List[List[int]] from select_chunks_per_layer; "
+                "flat List[int] is forbidden in strict mode."
             )
-            chunk_indices = list(per_layer_chunk_indices)
-            per_layer_chunk_indices = None
 
     # ── 分支 A：per-layer 独立检索模式 ────────────────────────────────────
     if per_layer_chunk_indices is not None:
@@ -389,13 +386,12 @@ def decode_kvcache(
         # 原因：K 向量保留了 encode 时的绝对位置（post-RoPE baked-in）；
         # 若 Q < 某 K 位置，相对距离为负，破坏因果注意力 → 模型立即输出 <|im_end|>
         manifest_path = os.path.join(kv_cache_path, "manifest.json")
-        try:
-            with open(manifest_path, "r", encoding="utf-8") as _f:
-                _manifest = json.load(_f)
-            _common = _manifest.get("common_metadata", {}) or {}
-            full_merged_seq_len_for_pos = int(_common.get("full_merged_seq_len", past_seq_len))
-        except Exception:
-            full_merged_seq_len_for_pos = past_seq_len
+        with open(manifest_path, "r", encoding="utf-8") as _f:
+            _manifest = json.load(_f)
+        _common = _manifest.get("common_metadata", {}) or {}
+        if "full_merged_seq_len" not in _common:
+            raise KeyError("manifest.common_metadata.full_merged_seq_len missing in strict mode")
+        full_merged_seq_len_for_pos = int(_common["full_merged_seq_len"])
         metadata = {"full_merged_seq_len": full_merged_seq_len_for_pos}
 
     # ── 分支 B：原有全局 chunk 模式（向后兼容）─────────────────────────────
