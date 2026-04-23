@@ -34,6 +34,7 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+from kvpack_mmap_td import KVPackReader, has_kvpack
 
 
 # ---------------------------------------------------------------------------
