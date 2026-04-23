@@ -273,6 +273,13 @@ def _load_prefix_cache(kv_cache_dir: str, map_location: str = "cpu"):
     """
     prefix_path = os.path.join(kv_cache_dir, "prefix_cache.safetensors")
     if not os.path.exists(prefix_path):
+        enc_path = prefix_path + ".enc"
+        if os.path.exists(enc_path):
+            raise FileNotFoundError(
+                "prefix_cache.safetensors is missing but encrypted prefix_cache.safetensors.enc exists. "
+                "Current strict policy keeps prefix in plaintext only. "
+                f"Please decrypt/restore prefix_cache.safetensors in {kv_cache_dir}."
+            )
         raise FileNotFoundError(f"prefix_cache.safetensors not found in {kv_cache_dir}")
     prefix_kv, meta = _load_single_safetensors_kv(prefix_path, map_location=map_location)
     prefix_seq_len = int(prefix_kv[0][0].shape[-2]) if prefix_kv else 0

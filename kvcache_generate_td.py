@@ -162,7 +162,7 @@ def _encode_and_save_prefix(encode_prefix, processor, model, kv_cache_dir, devic
     prefix_cache.safetensors。
 
     crypto_ctx : CryptoContext | None
-        不为 None 时，保存后立即加密为 prefix_cache.safetensors.enc 并删除明文。
+        仅为接口兼容保留。prefix cache 始终保持明文，不参与加密。
     """
     if not encode_prefix or not encode_prefix.strip():
         return None, 0
@@ -194,19 +194,8 @@ def _encode_and_save_prefix(encode_prefix, processor, model, kv_cache_dir, devic
                                       "prefix_text": text})
         print(f"[encode_prefix] Saved to {prefix_path}")
 
-        # 加密 prefix_cache（使用 chunk_index=-1 作为特殊 HKDF 标识）
-        if crypto_ctx is not None:
-            from pathlib import Path as _Path
-            crypto_ctx.maybe_encrypt_after_save(
-                prefix_path,
-                chunk_index=-1,
-                seq_start=0,
-                seq_end=prefix_seq_len,
-                chunk_size=0,
-                num_frames=0,
-                model_name=str(getattr(model.config, "_name_or_path", "")),
-                prefix_text=text,
-            )
+        # 设计约束：prefix_cache 体积很小，且属于非核心视频 KV，
+        # 为便于调试与稳定加载，始终保持明文，不执行加密。
 
     return prefix_kv, prefix_seq_len
 
