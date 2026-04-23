@@ -2,10 +2,10 @@
 
 import json
 import os
-import pickle
 
 import torch
 from safetensors import safe_open
+from kvpack_mmap_td import KVPackReader, has_kvpack
 
 
 def _to_model_cache(past_key_values):
@@ -167,39 +167,30 @@ def _assemble_per_layer_kv(
     per_layer_kv : tuple[L] of (K_L, V_L)   - 可直接传入 _to_model_cache()
     past_seq_len : int                        - 最大序列长度（含 padding）
     """
-    manifest_path = os.path.join(kv_cache_dir, "manifest.json")
-    with open(manifest_path, "r", encoding="utf-8") as f:
-        manifest = json.load(f)
-    chunks_by_idx = {int(c["chunk_index"]): c for c in manifest.get("chunks", [])}
-
-    # ── 1. 找出所有层选择的 chunk 的并集，每个 shard 文件只加载一次 ────────
-    union_ids = sorted(set(ci for ids in per_layer_chunk_indices for ci in ids))
-    loaded_chunks: dict = {}   # chunk_idx → tuple[L] of (K, V)
-    for ci in union_ids:
-        if ci not in chunks_by_idx:
-            raise KeyError(f"chunk_index {ci} not in manifest")
-        c = chunks_by_idx[ci]
-        shard_path = os.path.join(kv_cache_dir, c["file"])
-        if crypto_ctx is not None:
-            shard_path = crypto_ctx.maybe_decrypt_before_load(shard_path, chunk_index=ci)
-        shard_kv, _ = _load_single_safetensors_kv(shard_path, map_location)
-        loaded_chunks[ci] = shard_kv   # tuple[L] of (K:[1,Hkv,T,D], V)
-
-    # ── 2. 逐层拼装各自的 KV ──────────────────────────────────────────────
-    n_layers = len(per_layer_chunk_indices)
-    per_layer_kv = []
-    seq_lens = []
-
-    for L_idx in range(n_layers):
-        selected = per_layer_chunk_indices[L_idx]
-        if not selected:
-            raise ValueError(f"layer {L_idx} has empty chunk selection")
-        K_list = [loaded_chunks[ci][L_idx][0] for ci in selected]  # [1,Hkv,T_ci,D]
-        V_list = [loaded_chunks[ci][L_idx][1] for ci in selected]
-        K_cat = torch.cat(K_list, dim=-2)   # [1, Hkv, T_L, D]
-        V_cat = torch.cat(V_list, dim=-2)
-        per_layer_kv.append((K_cat, V_cat))
-        seq_lens.append(K_cat.shape[-2])
+    if not has_kvpack(kv_cache_dir):
+        raise FileNotFoundError(f"kvpack_index.json not found in {kv_cache_dir}")
+    reader = KVPackReader(kv_cache_dir)
+    try:
+        n_layers = len(per_layer_chunk_indices)
+        per_layer_kv = []
+        seq_lens = []
+        for L_idx in range(n_layers):
+            selected = per_layer_chunk_indices[L_idx]
+            if not selected:
+                raise ValueError(f"layer {L_idx} has empty chunk selection")
+            k_list = []
+            v_list = []
+            for frame_idx in selected:
+                k, v, _ = reader.read_layer_frame(L_idx, int(frame_idx), map_location=map_location)
+                k_list.append(k)
+                v_list.append(v)
+            K_cat = torch.cat(k_list, dim=-2)
+            V_cat = torch.cat(v_list, dim=-2)
+            per_layer_kv.append((K_cat, V_cat))
+            seq_lens.append(K_cat.shape[-2])
+        union_ids = sorted(set((L, ci) for L, ids in enumerate(per_layer_chunk_indices) for ci in ids))
+    finally:
+        reader.close()
 
     # ── 3. 处理不等长（temporal prune 场景）─────────────────────────────────
     unique_lens = set(seq_lens)
@@ -233,65 +224,46 @@ def _assemble_per_layer_kv(
 
 def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_indices=None):
     """从磁盘加载 KV cache 与元信息（优先 safetensors）。"""
-    manifest = None
-    selected_chunk = None
-    resolved_path = kv_cache_path
-    selected_chunks = None
-    if os.path.isdir(kv_cache_path):
-        resolved_files, manifest, selected_chunk, selected_chunks = _resolve_chunk_files_from_dir(
-            kv_cache_path, chunk_index=chunk_index, chunk_indices=chunk_indices
+    if not os.path.isdir(kv_cache_path) or not has_kvpack(kv_cache_path):
+        raise FileNotFoundError(
+            f"Only kvpack_mmap_v1 is supported now; kvpack_index.json not found in {kv_cache_path}"
         )
-        kv_segments = []
-        metadata = {}
-        for shard_path in resolved_files:
-            shard_kv, shard_metadata = _load_single_safetensors_kv(shard_path, map_location=map_location)
-            kv_segments.append(shard_kv)
-            metadata = shard_metadata
-        kv_cache = _concat_kv_segments(kv_segments)
-        full_seq_len = int(kv_cache[0][0].shape[-2]) if kv_cache else 0
-        if "past_seq_len" in metadata:
-            metadata["past_seq_len_shard"] = metadata["past_seq_len"]
-        metadata["past_seq_len"] = full_seq_len
-        metadata["chunk_manifest"] = manifest
-        metadata["selected_chunk"] = selected_chunk
-        metadata["loaded_chunks"] = selected_chunks
-        metadata["loaded_from_dir"] = kv_cache_path
-        loaded_indices = [int(c["chunk_index"]) for c in selected_chunks]
-        resolved_path = f"{kv_cache_path} (chunks {loaded_indices})"
-        # 从 manifest 的 common_metadata 提取真实的完整 merged 序列长度
-        if manifest:
-            common_meta = manifest.get("common_metadata", {}) or {}
-            if "full_merged_seq_len" in common_meta:
-                metadata["full_merged_seq_len"] = int(common_meta["full_merged_seq_len"])
-        print(f"Loaded KV cache from {resolved_path}")
-        if metadata:
-            print(f"KV metadata: {metadata}")
-        return kv_cache, metadata
-
-    if resolved_path.endswith(".safetensors"):
-        kv_cache, metadata = _load_single_safetensors_kv(resolved_path, map_location=map_location)
-    else:
-        # 兼容旧版 pt 存档（便于平滑迁移）
-        try:
-            payload = torch.load(resolved_path, map_location=map_location, weights_only=True)
-        except TypeError:
-            payload = torch.load(resolved_path, map_location=map_location)
-        except pickle.UnpicklingError as exc:
-            print("Warning: weights_only=True load failed, fallback to weights_only=False for trusted local cache.")
-            print(f"Details: {exc}")
-            payload = torch.load(resolved_path, map_location=map_location, weights_only=False)
-
-        if isinstance(payload, dict) and "kv_cache" in payload:
-            kv_cache = payload["kv_cache"]
-            metadata = payload.get("metadata", {})
+    reader = KVPackReader(kv_cache_path)
+    try:
+        frame_ids = sorted(reader.frames.keys())
+        if chunk_indices is not None:
+            min_idx = min(chunk_indices)
+            max_idx = max(chunk_indices)
+            selected_frames = [f for f in frame_ids if min_idx <= f <= max_idx]
         else:
-            kv_cache = payload
-            metadata = {}
+            max_frame = frame_ids[-1] if chunk_index is None else int(chunk_index)
+            selected_frames = [f for f in frame_ids if f <= max_frame]
 
-    print(f"Loaded KV cache from {resolved_path}")
-    if metadata:
-        print(f"KV metadata: {metadata}")
-    return kv_cache, metadata
+        n_layers = int(reader.common_metadata.get("num_layers", 0))
+        if n_layers <= 0:
+            n_layers = max((l for l, _ in reader.by_layer_frame.keys()), default=-1) + 1
+
+        per_layer = []
+        for layer_idx in range(n_layers):
+            k_list, v_list = [], []
+            for frame_idx in selected_frames:
+                k, v, _ = reader.read_layer_frame(layer_idx, frame_idx, map_location=map_location)
+                k_list.append(k)
+                v_list.append(v)
+            per_layer.append((torch.cat(k_list, dim=-2), torch.cat(v_list, dim=-2)))
+        kv_cache = tuple(per_layer)
+        full_seq_len = int(kv_cache[0][0].shape[-2]) if kv_cache else 0
+        metadata = {
+            "past_seq_len": full_seq_len,
+            "loaded_from_dir": kv_cache_path,
+            "loaded_chunks": selected_frames,
+            "full_merged_seq_len": int(reader.common_metadata.get("full_merged_seq_len", full_seq_len)),
+            "storage_format": "kvpack_mmap_v1",
+        }
+        print(f"Loaded KV cache from {kv_cache_path} (frames {selected_frames})")
+        return kv_cache, metadata
+    finally:
+        reader.close()
 
 
 def _load_prefix_cache(kv_cache_dir: str, map_location: str = "cpu"):
@@ -301,7 +273,14 @@ def _load_prefix_cache(kv_cache_dir: str, map_location: str = "cpu"):
     """
     prefix_path = os.path.join(kv_cache_dir, "prefix_cache.safetensors")
     if not os.path.exists(prefix_path):
-        return None, 0
+        enc_path = prefix_path + ".enc"
+        if os.path.exists(enc_path):
+            raise FileNotFoundError(
+                "prefix_cache.safetensors is missing but encrypted prefix_cache.safetensors.enc exists. "
+                "Current strict policy keeps prefix in plaintext only. "
+                f"Please decrypt/restore prefix_cache.safetensors in {kv_cache_dir}."
+            )
+        raise FileNotFoundError(f"prefix_cache.safetensors not found in {kv_cache_dir}")
     prefix_kv, meta = _load_single_safetensors_kv(prefix_path, map_location=map_location)
     prefix_seq_len = int(prefix_kv[0][0].shape[-2]) if prefix_kv else 0
     print(f"[load_prefix_cache] Loaded prefix KV: {prefix_seq_len} tokens from {prefix_path}")
@@ -377,13 +356,10 @@ def decode_kvcache(
         if len(per_layer_chunk_indices) == 0:
             per_layer_chunk_indices = None   # 空列表 → 全局模式
         elif isinstance(per_layer_chunk_indices[0], int):
-            print(
-                "[decode] WARNING: per_layer_chunk_indices received a flat List[int] "
-                "(looks like output of select_chunks, not select_chunks_per_layer). "
-                "Treating as chunk_indices and falling back to global mode."
+            raise TypeError(
+                "per_layer_chunk_indices must be List[List[int]] from select_chunks_per_layer; "
+                "flat List[int] is forbidden in strict mode."
             )
-            chunk_indices = list(per_layer_chunk_indices)
-            per_layer_chunk_indices = None
 
     # ── 分支 A：per-layer 独立检索模式 ────────────────────────────────────
     if per_layer_chunk_indices is not None:
@@ -417,13 +393,12 @@ def decode_kvcache(
         # 原因：K 向量保留了 encode 时的绝对位置（post-RoPE baked-in）；
         # 若 Q < 某 K 位置，相对距离为负，破坏因果注意力 → 模型立即输出 <|im_end|>
         manifest_path = os.path.join(kv_cache_path, "manifest.json")
-        try:
-            with open(manifest_path, "r", encoding="utf-8") as _f:
-                _manifest = json.load(_f)
-            _common = _manifest.get("common_metadata", {}) or {}
-            full_merged_seq_len_for_pos = int(_common.get("full_merged_seq_len", past_seq_len))
-        except Exception:
-            full_merged_seq_len_for_pos = past_seq_len
+        with open(manifest_path, "r", encoding="utf-8") as _f:
+            _manifest = json.load(_f)
+        _common = _manifest.get("common_metadata", {}) or {}
+        if "full_merged_seq_len" not in _common:
+            raise KeyError("manifest.common_metadata.full_merged_seq_len missing in strict mode")
+        full_merged_seq_len_for_pos = int(_common["full_merged_seq_len"])
         metadata = {"full_merged_seq_len": full_merged_seq_len_for_pos}
 
     # ── 分支 B：原有全局 chunk 模式（向后兼容）─────────────────────────────

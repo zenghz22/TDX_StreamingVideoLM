@@ -4,7 +4,6 @@ import time
 import argparse
 
 from kvcache_generate_td import load_model, load_video, encode_video
-from kvcache_manager_td import KVCacheManager
 from kvcache_retrieve_td import decode_kvcache
 from kvcache_select_td import select_chunks, select_chunks_per_layer
 from zhz_hardware_eval_utils import *
@@ -57,34 +56,26 @@ if __name__ == "__main__":
     # ── 构建 PruneContext（encode 侧使用）────────────────────────────────
     prune_ctx = None
     if args.prune and (args.prune_temporal > 0 or args.prune_spatial > 0):
-        try:
-            from video_prune import PruneContext
-            prune_ctx = PruneContext(
-                enabled=True,
-                temporal_enabled=(args.prune_temporal > 0),
-                temporal_keep_ratio=args.prune_temporal if args.prune_temporal > 0 else 0.6,
-                spatial_enabled=(args.prune_spatial > 0),
-                spatial_ratio=args.prune_spatial if args.prune_spatial > 0 else None,
-                log_stats=True,
-            )
-            logger.info(
-                f"[prune] Enabled: temporal_keep_ratio={args.prune_temporal}, "
-                f"spatial_ratio={args.prune_spatial}"
-            )
-        except ImportError:
-            logger.warning("[prune] video_prune not found, pruning disabled.")
+        from video_prune import PruneContext
+        prune_ctx = PruneContext(
+            enabled=True,
+            temporal_enabled=(args.prune_temporal > 0),
+            temporal_keep_ratio=args.prune_temporal if args.prune_temporal > 0 else 0.6,
+            spatial_enabled=(args.prune_spatial > 0),
+            spatial_ratio=args.prune_spatial if args.prune_spatial > 0 else None,
+            log_stats=True,
+        )
+        logger.info(
+            f"[prune] Enabled: temporal_keep_ratio={args.prune_temporal}, "
+            f"spatial_ratio={args.prune_spatial}"
+        )
 
     # ── 构建 CryptoContext（encode/decode 双侧使用）───────────────────────
     crypto_ctx = None
     if args.encrypt:
-        try:
-            from kvcache_crypto_td import CryptoContext
-            crypto_ctx = CryptoContext.from_key_file(args.key_file, create=True)
-            logger.info(f"[crypto] Encryption enabled. Key file: {args.key_file}")
-        except ImportError:
-            logger.warning("[crypto] kvcache_crypto_td not found, encryption disabled.")
-        except Exception as e:
-            logger.warning(f"[crypto] Failed to load key: {e}. Encryption disabled.")
+        from kvcache_crypto_td import CryptoContext
+        crypto_ctx = CryptoContext.from_key_file(args.key_file, create=True)
+        logger.info(f"[crypto] Encryption enabled. Key file: {args.key_file}")
 
     with measure_resources(args.mode, logger=logger, plot_file=args.plot_file, plot_lable=False) as monitor:
         # ── 编码阶段 ──────────────────────────────────────────────────────────
@@ -97,12 +88,6 @@ if __name__ == "__main__":
             video = load_video(video_path, sample_fps=0.5)
 
             monitor["mark"]("kvcache_encode_start")
-            manager = KVCacheManager(
-                kv_cache_dir=kv_cache_path,
-                max_in_memory=args.encode_memory,
-                window_size=args.encode_window if args.encode_window > 0 else None,
-                device="cpu",
-            )
             encode_video(
                 video=video,
                 processor=processor,
@@ -111,14 +96,15 @@ if __name__ == "__main__":
                 encode_prefix=encode_prefix,
                 stage_mark=monitor["mark"],
                 kv_cache_dir=kv_cache_path,
-                manager=manager,
                 prune_ctx=prune_ctx,
                 crypto_ctx=crypto_ctx,
+                max_in_memory=args.encode_memory,
+                window_size=args.encode_window if args.encode_window > 0 else None,
             )
             monitor["mark"]("kvcache_encode_done")
 
             remove_timing_hooks_from_model()
-            del model, manager
+            del model
             gc.collect()
             time.sleep(10)
 
