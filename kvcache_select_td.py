@@ -34,6 +34,7 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+from kvpack_mmap_td import KVPackReader, has_kvpack
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +56,7 @@ def _load_manifest_chunks(kv_cache_dir: str):
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
-    chunks = sorted(manifest.get("chunks", []), key=lambda c: int(c["chunk_index"]))
+    chunks = sorted(manifest.get("chunks", []), key=lambda c: int(c.get("chunk_index", c.get("frame_index", -1))))
     if not chunks:
         raise ValueError("No chunk records in manifest.")
 
@@ -71,8 +72,6 @@ def _load_chunk_layer_key_vecs(kv_cache_dir: str):
     chunk_indices : List[int]
     layer_key_vecs: torch.Tensor  [N, L, Hkv, D]
     """
-    from kvcache_retrieve_td import _load_single_safetensors_kv
-
     # 优先读取 encode 阶段写好的轻量检索索引，避免逐 shard 扫描
     index_path = os.path.join(kv_cache_dir, "retrieval_index.safetensors")
     if os.path.exists(index_path):
@@ -82,21 +81,26 @@ def _load_chunk_layer_key_vecs(kv_cache_dir: str):
                 layer_key_vecs = f.get_tensor("layer_key_vecs").float()
                 return chunk_indices, layer_key_vecs
 
-    chunks = _load_manifest_chunks(kv_cache_dir)
-    chunk_indices = []
-    layer_vecs = []
-    for c in chunks:
-        chunk_idx = int(c["chunk_index"])
-        shard_path = os.path.join(kv_cache_dir, c["file"])
-        shard_kv, _ = _load_single_safetensors_kv(shard_path, map_location="cpu")
-        # shard_kv: tuple[L] of (k,v), k shape=[B,Hkv,T,D]
-        per_layer = []
-        for layer_k, _ in shard_kv:
-            per_layer.append(layer_k[0].mean(dim=1).float())  # [Hkv, D]
-        chunk_indices.append(chunk_idx)
-        layer_vecs.append(torch.stack(per_layer, dim=0))      # [L, Hkv, D]
-
-    return chunk_indices, torch.stack(layer_vecs, dim=0)      # [N, L, Hkv, D]
+    if not has_kvpack(kv_cache_dir):
+        raise FileNotFoundError(
+            f"Only kvpack_mmap_v1 is supported now; kvpack_index.json not found in {kv_cache_dir}"
+        )
+    reader = KVPackReader(kv_cache_dir)
+    try:
+        frame_ids = sorted(reader.frames.keys())
+        n_layers = int(reader.common_metadata.get("num_layers", 0))
+        if n_layers <= 0:
+            n_layers = max((l for l, _ in reader.by_layer_frame.keys()), default=-1) + 1
+        layer_vecs = []
+        for fi in frame_ids:
+            per_layer = []
+            for li in range(n_layers):
+                k, _, _ = reader.read_layer_frame(li, fi, map_location="cpu")
+                per_layer.append(k[0].mean(dim=1).float())  # [Hkv, D]
+            layer_vecs.append(torch.stack(per_layer, dim=0))
+        return frame_ids, torch.stack(layer_vecs, dim=0)
+    finally:
+        reader.close()
 
 
 # ---------------------------------------------------------------------------
