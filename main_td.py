@@ -22,6 +22,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default="encode_decode",
                         choices=["encode_decode", "decode", "encode"])
     parser.add_argument("--plot_file", type=str, default=None)
+    parser.add_argument("--chunk_size", type=int, default=1)
     parser.add_argument("--encode_memory", type=int, default=64)
     parser.add_argument("--encode_window", type=int, default=0)
     parser.add_argument("--decode_select", type=int, default=0)
@@ -77,7 +78,7 @@ if __name__ == "__main__":
         crypto_ctx = CryptoContext.from_key_file(args.key_file, create=True)
         logger.info(f"[crypto] Encryption enabled. Key file: {args.key_file}")
 
-    with measure_resources(args.mode, logger=logger, plot_file=args.plot_file, plot_lable=False) as monitor:
+    with measure_resources(args.mode, logger=logger, plot_file=args.plot_file, plot_lable=True) as monitor:
         # ── 编码阶段 ──────────────────────────────────────────────────────────
         if args.mode in ("encode_decode", "encode"):
 
@@ -92,7 +93,7 @@ if __name__ == "__main__":
                 video=video,
                 processor=processor,
                 model=model,
-                chunk_size=1,
+                chunk_size=args.chunk_size,
                 encode_prefix=encode_prefix,
                 stage_mark=monitor["mark"],
                 kv_cache_dir=kv_cache_path,
