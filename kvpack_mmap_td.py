@@ -83,6 +83,7 @@ class KVPackWriter:
         seq_end: int,
         key_tensor: torch.Tensor,
         value_tensor: torch.Tensor,
+        encrypt_fn=None,
     ) -> dict:
         k = key_tensor.detach().to("cpu").contiguous()
         v = value_tensor.detach().to("cpu").contiguous()
@@ -100,9 +101,13 @@ class KVPackWriter:
             "k_shape": list(k.shape),
             "v_shape": list(v.shape),
             "k_nbytes": len(k_bytes),
+            "encrypted": False,
         }
-        header_bytes = json.dumps(header, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         payload = k_bytes + v_bytes
+        if encrypt_fn is not None:
+            payload = encrypt_fn(payload, header)
+            header["encrypted"] = True
+        header_bytes = json.dumps(header, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
         offset = self._f.tell()
         self._f.write(BLOCK_HEAD.pack(BLOCK_MAGIC, len(header_bytes), len(payload)))
@@ -166,7 +171,7 @@ class KVPackReader:
             raise ValueError("payload_len mismatch between index and block")
         return header
 
-    def read_layer_frame(self, layer_index: int, frame_index: int, *, map_location: str = "cpu"):
+    def read_layer_frame(self, layer_index: int, frame_index: int, *, map_location: str = "cpu", decrypt_fn=None):
         rec = self.by_layer_frame[(int(layer_index), int(frame_index))]
         header = self._read_header(rec)
         dtype_key = header["dtype"]
@@ -181,6 +186,12 @@ class KVPackReader:
         payload_len = int(rec["payload_len"])
 
         kv_bytes = self._mmap[pstart: pstart + payload_len]
+        if bool(header.get("encrypted", False)):
+            if decrypt_fn is None:
+                raise RuntimeError(
+                    f"Encrypted kvpack block requires decrypt_fn: layer={layer_index}, frame={frame_index}"
+                )
+            kv_bytes = decrypt_fn(bytes(kv_bytes), header)
         k_buf = np.frombuffer(kv_bytes, dtype=np_dtype, count=k_nbytes // np.dtype(np_dtype).itemsize, offset=0)
         v_off = k_nbytes
         v_count = (payload_len - k_nbytes) // np.dtype(np_dtype).itemsize

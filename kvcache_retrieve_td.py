@@ -169,6 +169,30 @@ def _assemble_per_layer_kv(
     """
     if not has_kvpack(kv_cache_dir):
         raise FileNotFoundError(f"kvpack_index.json not found in {kv_cache_dir}")
+    decrypt_payload_fn = None
+    if crypto_ctx is not None and getattr(crypto_ctx, "enabled", False):
+        from kvcache_crypto_td import layer_frame_block_id, decrypt_blob_to_bytes
+        def _decrypt_payload(blob: bytes, header: dict) -> bytes:
+            n_layers = int(max(1, len(per_layer_chunk_indices)))
+            block_id = layer_frame_block_id(
+                frame_index=int(header["frame_index"]),
+                layer_index=int(header["layer_index"]),
+                num_layers=n_layers,
+            )
+            aad = {
+                "frame_index": int(header["frame_index"]),
+                "layer_index": int(header["layer_index"]),
+                "seq_start": int(header["seq_start"]),
+                "seq_end": int(header["seq_end"]),
+                "dtype": str(header["dtype"]),
+            }
+            return decrypt_blob_to_bytes(
+                blob,
+                crypto_ctx.master_key,
+                expected_chunk_index=block_id,
+                expected_aad=aad,
+            )
+        decrypt_payload_fn = _decrypt_payload
     reader = KVPackReader(kv_cache_dir)
     try:
         n_layers = len(per_layer_chunk_indices)
@@ -181,7 +205,9 @@ def _assemble_per_layer_kv(
             k_list = []
             v_list = []
             for frame_idx in selected:
-                k, v, _ = reader.read_layer_frame(L_idx, int(frame_idx), map_location=map_location)
+                k, v, _ = reader.read_layer_frame(
+                    L_idx, int(frame_idx), map_location=map_location, decrypt_fn=decrypt_payload_fn
+                )
                 k_list.append(k)
                 v_list.append(v)
             K_cat = torch.cat(k_list, dim=-2)
@@ -222,12 +248,35 @@ def _assemble_per_layer_kv(
     return tuple(per_layer_kv), past_seq_len
 
 
-def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_indices=None):
+def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_indices=None, crypto_ctx=None):
     """从磁盘加载 KV cache 与元信息（优先 safetensors）。"""
     if not os.path.isdir(kv_cache_path) or not has_kvpack(kv_cache_path):
         raise FileNotFoundError(
             f"Only kvpack_mmap_v1 is supported now; kvpack_index.json not found in {kv_cache_path}"
         )
+    decrypt_payload_fn = None
+    if crypto_ctx is not None and getattr(crypto_ctx, "enabled", False):
+        from kvcache_crypto_td import layer_frame_block_id, decrypt_blob_to_bytes
+        def _decrypt_payload(blob: bytes, header: dict, n_layers_hint: int) -> bytes:
+            block_id = layer_frame_block_id(
+                frame_index=int(header["frame_index"]),
+                layer_index=int(header["layer_index"]),
+                num_layers=n_layers_hint,
+            )
+            aad = {
+                "frame_index": int(header["frame_index"]),
+                "layer_index": int(header["layer_index"]),
+                "seq_start": int(header["seq_start"]),
+                "seq_end": int(header["seq_end"]),
+                "dtype": str(header["dtype"]),
+            }
+            return decrypt_blob_to_bytes(
+                blob,
+                crypto_ctx.master_key,
+                expected_chunk_index=block_id,
+                expected_aad=aad,
+            )
+        decrypt_payload_fn = _decrypt_payload
     reader = KVPackReader(kv_cache_path)
     try:
         frame_ids = sorted(reader.frames.keys())
@@ -247,7 +296,10 @@ def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_ind
         for layer_idx in range(n_layers):
             k_list, v_list = [], []
             for frame_idx in selected_frames:
-                k, v, _ = reader.read_layer_frame(layer_idx, frame_idx, map_location=map_location)
+                dec_fn = None if decrypt_payload_fn is None else (lambda blob, h, _n=n_layers: decrypt_payload_fn(blob, h, _n))
+                k, v, _ = reader.read_layer_frame(
+                    layer_idx, frame_idx, map_location=map_location, decrypt_fn=dec_fn
+                )
                 k_list.append(k)
                 v_list.append(v)
             per_layer.append((torch.cat(k_list, dim=-2), torch.cat(v_list, dim=-2)))
@@ -405,7 +457,7 @@ def decode_kvcache(
     else:
         kv_cache, metadata = load_kv_cache(
             kv_cache_path, map_location="cpu",
-            chunk_index=chunk_index, chunk_indices=chunk_indices,
+            chunk_index=chunk_index, chunk_indices=chunk_indices, crypto_ctx=crypto_ctx,
         )
         if not kv_cache:
             raise ValueError("KV cache is empty.")

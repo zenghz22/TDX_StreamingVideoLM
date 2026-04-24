@@ -252,6 +252,30 @@ def encode_video(
     # 帧级缓存：frame_idx -> tuple[L](k,v)
     frame_cache = {}
     frame_order = []
+    encrypt_payload_fn = None
+    if crypto_ctx is not None and getattr(crypto_ctx, "enabled", False):
+        from kvcache_crypto_td import layer_frame_block_id, encrypt_bytes_to_blob
+        def _encrypt_payload(payload_bytes: bytes, header: dict) -> bytes:
+            n_layers = int(common_metadata.get("num_layers", getattr(model.config, "num_hidden_layers", 0)))
+            block_id = layer_frame_block_id(
+                frame_index=int(header["frame_index"]),
+                layer_index=int(header["layer_index"]),
+                num_layers=n_layers,
+            )
+            aad = {
+                "frame_index": int(header["frame_index"]),
+                "layer_index": int(header["layer_index"]),
+                "seq_start": int(header["seq_start"]),
+                "seq_end": int(header["seq_end"]),
+                "dtype": str(header["dtype"]),
+            }
+            return encrypt_bytes_to_blob(
+                payload_bytes,
+                crypto_ctx.master_key,
+                chunk_index=block_id,
+                aad=aad,
+            )
+        encrypt_payload_fn = _encrypt_payload
 
     # ---- 前缀单独编码 ----
     # encode_prefix 文字 token 的 KV 存为 prefix_cache.safetensors；
@@ -495,6 +519,7 @@ def encode_video(
                         seq_end=int(full_kv_seq_len),
                         key_tensor=layer_k,
                         value_tensor=layer_v,
+                        encrypt_fn=encrypt_payload_fn,
                     )
                     rec["chunk_index"] = int(i)
                     rec["block_index"] = len(chunk_records)
