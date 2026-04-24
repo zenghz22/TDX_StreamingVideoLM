@@ -472,6 +472,13 @@ def chunk_enc_path(kv_cache_dir: Union[str, os.PathLike], chunk_index: int) -> s
     return str(Path(kv_cache_dir) / f"chunk_{chunk_index:05d}.safetensors.enc")
 
 
+def layer_frame_block_id(frame_index: int, layer_index: int, num_layers: int) -> int:
+    """为 layer-frame 粒度块生成稳定 ID（用于 HKDF / AAD 场景）。"""
+    if num_layers <= 0:
+        raise ValueError("num_layers must be > 0")
+    return int(frame_index) * int(num_layers) + int(layer_index)
+
+
 def encrypt_chunk_by_index(
     kv_cache_dir: Union[str, os.PathLike],
     chunk_index: int,
