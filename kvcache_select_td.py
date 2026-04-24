@@ -63,27 +63,78 @@ def _load_manifest_chunks(kv_cache_dir: str):
     return chunks
 
 
-def _load_chunk_layer_key_vecs(kv_cache_dir: str):
+def _load_chunk_layer_key_vecs(kv_cache_dir: str, crypto_ctx=None):
     """
     ReKV internal 风格：直接从每个 chunk shard 提取逐层 K 向量均值。
+
+    方向 D：支持透明解密 retrieval_index.safetensors.enc。
+    若加密文件存在且 crypto_ctx 已启用，先在 TDX 内部解密到临时内存，
+    再加载 tensor，临时文件用后立即删除。
+    若明文文件存在（未加密模式），直接加载。
 
     Returns
     -------
     chunk_indices : List[int]
     layer_key_vecs: torch.Tensor  [N, L, Hkv, D]
     """
-    # 严格模式：必须使用 encode 阶段写好的轻量检索索引
     index_path = os.path.join(kv_cache_dir, "retrieval_index.safetensors")
+    enc_path   = index_path + ".enc"
+
+    # ── 方向 D：检测加密文件，透明解密 ──────────────────────────────────────
+    if not os.path.exists(index_path) and os.path.exists(enc_path):
+        if crypto_ctx is None or not getattr(crypto_ctx, "enabled", False):
+            raise PermissionError(
+                f"retrieval_index is encrypted ({os.path.basename(enc_path)}) "
+                f"but no crypto_ctx provided. Cannot load without decryption key."
+            )
+        try:
+            import tempfile
+            from kvcache_crypto_td import decrypt_blob_to_bytes
+            ciphertext = open(enc_path, "rb").read()
+            plaintext = decrypt_blob_to_bytes(
+                ciphertext,
+                crypto_ctx.master_key,
+                expected_chunk_index=-1,
+                expected_aad=None,   # AAD 校验已内嵌在 blob 头部
+            )
+            # 写入临时文件（safetensors 必须从文件读，不支持 BytesIO）
+            tmp_fd, tmp_plain = tempfile.mkstemp(suffix=".safetensors")
+            try:
+                os.write(tmp_fd, plaintext)
+                os.close(tmp_fd)
+                print(f"[crypto/D] retrieval_index decrypted in TDX for select.")
+                index_path = tmp_plain   # 指向临时明文文件
+                _cleanup_tmp = tmp_plain  # 记录，加载后删除
+            except Exception:
+                os.close(tmp_fd)
+                os.unlink(tmp_plain)
+                raise
+        except Exception as e:
+            raise RuntimeError(f"Failed to decrypt retrieval_index: {e}") from e
+    else:
+        _cleanup_tmp = None
+
     if not os.path.exists(index_path):
         raise FileNotFoundError(
-            f"retrieval_index.safetensors not found in {kv_cache_dir}; strict mode forbids fallback."
+            f"retrieval_index.safetensors not found in {kv_cache_dir}; "
+            f"strict mode forbids fallback."
         )
-    with safe_open(index_path, framework="pt", device="cpu") as f:
-        if "chunk_indices" not in f.keys() or "layer_key_vecs" not in f.keys():
-            raise KeyError("retrieval_index.safetensors missing required tensors: chunk_indices/layer_key_vecs")
-        chunk_indices = [int(v) for v in f.get_tensor("chunk_indices").tolist()]
-        layer_key_vecs = f.get_tensor("layer_key_vecs").float()
-        return chunk_indices, layer_key_vecs
+
+    try:
+        with safe_open(index_path, framework="pt", device="cpu") as f:
+            if "chunk_indices" not in f.keys() or "layer_key_vecs" not in f.keys():
+                raise KeyError("retrieval_index.safetensors missing required tensors: chunk_indices/layer_key_vecs")
+            chunk_indices = [int(v) for v in f.get_tensor("chunk_indices").tolist()]
+            layer_key_vecs = f.get_tensor("layer_key_vecs").float()
+    finally:
+        # 加载完成后立即删除临时明文文件
+        if _cleanup_tmp is not None:
+            try:
+                os.unlink(_cleanup_tmp)
+            except Exception:
+                pass
+
+    return chunk_indices, layer_key_vecs
 
 
 # ---------------------------------------------------------------------------
@@ -211,19 +262,15 @@ def select_chunks(
     processor,
     model,
     top_k: int = 8,
+    crypto_ctx=None,
 ) -> List[int]:
     """
     Prompt-aware chunk 选择，返回与 question 最相关的 top_k 个 chunk_index。
 
-    - 不再强制包含 chunk 0：prefix_cache.safetensors 已承载 encode_prefix
-      语义锚点，chunk 0 现在只是普通视频 chunk。
-    - 不再要求连续：decode 侧的 position_ids 修正确保 Q 始终在
-      full_merged_seq_len 处，K 向量保留 encode 时的绝对位置，
-      cos(pos_q - pos_k) 对任意非连续 chunk 组合都正确。
-
-    返回按 chunk_index 升序排列的列表（保留时序，便于 attention mask 构建）。
+    crypto_ctx : CryptoContext | None
+        若 retrieval_index 已加密（方向 D），需传入以在 TDX 内部解密。
     """
-    all_indices, chunk_layer_key_vecs = _load_chunk_layer_key_vecs(kv_cache_dir)
+    all_indices, chunk_layer_key_vecs = _load_chunk_layer_key_vecs(kv_cache_dir, crypto_ctx=crypto_ctx)
     n_chunks = len(all_indices)
 
     if n_chunks == 0:
@@ -259,40 +306,15 @@ def select_chunks_per_layer(
     processor,
     model,
     top_k: int = 8,
+    crypto_ctx=None,
 ) -> List[List[int]]:
     """
-    ReKV ICLR'25 Section 3 Internal Retrieval 的直接实现：
-    每个 attention layer 用自己的 Q 和 K 向量独立选出 top_k 个最相关 chunk，
-    不同层的选择结果可以（且通常会）不同。
+    ReKV ICLR'25 Section 3 Internal Retrieval 的直接实现。
 
-    原论文原文：
-        "internal retrieval [...] operates independently within each self-attention
-         layer, allowing different layers to retrieve different video blocks.
-         This allows for a broader capture of video context."
-        "The average of the key vectors of a frame is computed as its representative
-         frame vector [...] concatenated across heads into a single vector."
-
-    与 select_chunks() 的区别
-    -------------------------
-    select_chunks()       : mean over layers → 单一全局 chunk 选择（所有层共享）
-    select_chunks_per_layer: per-layer 独立 → List[L] 每层各自的 top_k chunk 列表
-
-    参数
-    ----
-    top_k : 每层各自选 top_k 个 chunk（不同层可能不同，但数目相同）
-
-    返回
-    ----
-    per_layer_chunk_ids : List[List[int]]
-        长度 = 模型层数（如 28）
-        per_layer_chunk_ids[L] = 第 L 层选出的 chunk_index 列表（升序）
-
-    使用方式
-    --------
-    per_layer_ids = select_chunks_per_layer(kv_dir, q, proc, model, top_k=8)
-    answer = decode_kvcache(..., per_layer_chunk_indices=per_layer_ids)
+    crypto_ctx : CryptoContext | None
+        若 retrieval_index 已加密（方向 D），需传入以在 TDX 内部解密。
     """
-    all_indices, chunk_layer_key_vecs = _load_chunk_layer_key_vecs(kv_cache_dir)
+    all_indices, chunk_layer_key_vecs = _load_chunk_layer_key_vecs(kv_cache_dir, crypto_ctx=crypto_ctx)
     # chunk_layer_key_vecs: [N, L, Hkv, D]
     n_chunks = len(all_indices)
 

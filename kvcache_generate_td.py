@@ -126,12 +126,16 @@ def _write_chunk_manifest(kv_cache_dir, chunks, common_metadata):
     print(f"KV chunk manifest saved to {manifest_path}")
 
 
-def _write_retrieval_index(kv_cache_dir, chunk_indices, layer_key_vecs, summary_vecs, common_metadata):
+def _write_retrieval_index(kv_cache_dir, chunk_indices, layer_key_vecs, summary_vecs, common_metadata, crypto_ctx=None):
     """
     将 select 所需的轻量向量索引写入独立文件（方案 A + C）：
       - chunk_indices : [N]
       - layer_key_vecs: [N, L, Hkv, D]
       - summary_vecs  : [N, Hkv*D]
+
+    方向 D：若 crypto_ctx 启用，写完明文后立即加密为
+    retrieval_index.safetensors.enc 并删除明文。
+    这样 Host 侧磁盘上只有密文，KV 向量的语义信息不泄露到 TDX 外部。
     """
     if not chunk_indices:
         return
@@ -150,6 +154,29 @@ def _write_retrieval_index(kv_cache_dir, chunk_indices, layer_key_vecs, summary_
     metadata_str = {k: json.dumps(v, ensure_ascii=False) for k, v in metadata.items()}
     save_file(tensors, index_path, metadata=metadata_str)
     print(f"Retrieval index saved to {index_path}")
+
+    # ── 方向 D：加密 retrieval_index，防止语义信息在 TDX 外泄露 ─────────────
+    if crypto_ctx is not None and getattr(crypto_ctx, "enabled", False):
+        try:
+            from kvcache_crypto_td import encrypt_bytes_to_blob
+            enc_path = index_path + ".enc"
+            plaintext = open(index_path, "rb").read()
+            # chunk_index=-1 作为 retrieval_index 的专属 HKDF 派生标识
+            blob = encrypt_bytes_to_blob(
+                plaintext,
+                crypto_ctx.master_key,
+                chunk_index=-1,
+                aad={"file": "retrieval_index", "num_chunks": len(chunk_indices)},
+            )
+            # 原子写入
+            tmp_path = enc_path + ".tmp"
+            with open(tmp_path, "wb") as f:
+                f.write(blob)
+            os.replace(tmp_path, enc_path)
+            os.unlink(index_path)   # 删除明文
+            print(f"[crypto/D] retrieval_index encrypted → {os.path.basename(enc_path)} (plaintext deleted)")
+        except Exception as e:
+            print(f"[crypto/D] WARNING: retrieval_index encryption failed: {e}. Plaintext retained.")
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +587,7 @@ def encode_video(
             retrieval_layer_key_vecs,
             retrieval_summary_vecs,
             common_metadata,
+            crypto_ctx=crypto_ctx,
         )
 
     return None

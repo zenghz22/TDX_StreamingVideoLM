@@ -169,15 +169,22 @@ def _assemble_per_layer_kv(
     """
     if not has_kvpack(kv_cache_dir):
         raise FileNotFoundError(f"kvpack_index.json not found in {kv_cache_dir}")
+
+    # 先打开 reader 取 common_metadata，确保 num_layers 与 encrypt 侧对齐
+    reader = KVPackReader(kv_cache_dir)
+    # ── Bug fix：num_layers 必须与 encrypt_fn 里的值完全相同，
+    # 否则 layer_frame_block_id = frame * num_layers + layer 产生不同值 → HKDF 派生不同密钥 → 解密失败
+    # 正确来源：kvpack_index.json 的 common_metadata["num_layers"]，与 encode 阶段写入的值一致
+    num_layers_for_key = int(reader.common_metadata.get("num_layers", len(per_layer_chunk_indices)))
+
     decrypt_payload_fn = None
     if crypto_ctx is not None and getattr(crypto_ctx, "enabled", False):
         from kvcache_crypto_td import layer_frame_block_id, decrypt_blob_to_bytes
         def _decrypt_payload(blob: bytes, header: dict) -> bytes:
-            n_layers = int(max(1, len(per_layer_chunk_indices)))
             block_id = layer_frame_block_id(
                 frame_index=int(header["frame_index"]),
                 layer_index=int(header["layer_index"]),
-                num_layers=n_layers,
+                num_layers=num_layers_for_key,   # 从 common_metadata 读取，与 encrypt 一致
             )
             aad = {
                 "frame_index": int(header["frame_index"]),
@@ -193,7 +200,6 @@ def _assemble_per_layer_kv(
                 expected_aad=aad,
             )
         decrypt_payload_fn = _decrypt_payload
-    reader = KVPackReader(kv_cache_dir)
     try:
         n_layers = len(per_layer_chunk_indices)
         per_layer_kv = []

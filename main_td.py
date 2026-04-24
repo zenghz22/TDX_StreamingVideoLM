@@ -141,6 +141,7 @@ if __name__ == "__main__":
                     processor, 
                     model, 
                     top_k=args.decode_select,
+                    crypto_ctx=crypto_ctx,   # 方向D：retrieval_index 可能已加密
                 )
                 logger.info(f"Decoding with top-{args.decode_select} selected chunks.")
             else:
