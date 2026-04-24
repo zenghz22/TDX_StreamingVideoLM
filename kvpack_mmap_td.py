@@ -192,9 +192,14 @@ class KVPackReader:
                     f"Encrypted kvpack block requires decrypt_fn: layer={layer_index}, frame={frame_index}"
                 )
             kv_bytes = decrypt_fn(bytes(kv_bytes), header)
+        payload_len_eff = len(kv_bytes)
+        if payload_len_eff < k_nbytes:
+            raise ValueError(
+                f"Decrypted payload smaller than key bytes: payload={payload_len_eff}, k_nbytes={k_nbytes}"
+            )
         k_buf = np.frombuffer(kv_bytes, dtype=np_dtype, count=k_nbytes // np.dtype(np_dtype).itemsize, offset=0)
         v_off = k_nbytes
-        v_count = (payload_len - k_nbytes) // np.dtype(np_dtype).itemsize
+        v_count = (payload_len_eff - k_nbytes) // np.dtype(np_dtype).itemsize
         v_buf = np.frombuffer(kv_bytes, dtype=np_dtype, count=v_count, offset=v_off)
 
         k = torch.from_numpy(k_buf.copy()).reshape(header["k_shape"])
