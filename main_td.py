@@ -43,8 +43,6 @@ if __name__ == "__main__":
     # ── 加密参数 ──────────────────────────────────────────────────────────
     parser.add_argument("--encrypt", action="store_true",
                         help="启用 KV cache 加密（encode 时加密，decode 时自动解密）")
-    parser.add_argument("--key_file", type=str, default="../data/master.key",
-                        help="master key 文件路径（首次运行自动生成）")
 
     args = parser.parse_args()
 
@@ -53,6 +51,7 @@ if __name__ == "__main__":
     kv_cache_path = "../data/kv_cache_chunks"
     question      = "Who is in the video, and what are they doing?"
     encode_prefix = "You are a helpful assistant. Please understand the video content and prepare to answer single-choice questions."
+    key_file       = "../data/master.key"
 
     # ── 构建 PruneContext（encode 侧使用）────────────────────────────────
     prune_ctx = None
@@ -75,8 +74,11 @@ if __name__ == "__main__":
     crypto_ctx = None
     if args.encrypt:
         from kvcache_crypto_td import CryptoContext
-        crypto_ctx = CryptoContext.from_key_file(args.key_file, create=True)
-        logger.info(f"[crypto] Encryption enabled. Key file: {args.key_file}")
+        crypto_ctx = CryptoContext.from_key_file(
+            key_file,
+            create=True,
+        )
+        logger.info(f"[crypto] Encryption enabled. Key file: {key_file}")
 
     with measure_resources(args.mode, logger=logger, plot_file=args.plot_file, plot_lable=True) as monitor:
         # ── 编码阶段 ──────────────────────────────────────────────────────────
