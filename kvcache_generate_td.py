@@ -126,16 +126,12 @@ def _write_chunk_manifest(kv_cache_dir, chunks, common_metadata):
     print(f"KV chunk manifest saved to {manifest_path}")
 
 
-def _write_retrieval_index(kv_cache_dir, chunk_indices, layer_key_vecs, summary_vecs, common_metadata, crypto_ctx=None):
+def _write_retrieval_index(kv_cache_dir, chunk_indices, layer_key_vecs, summary_vecs, common_metadata):
     """
     将 select 所需的轻量向量索引写入独立文件（方案 A + C）：
       - chunk_indices : [N]
       - layer_key_vecs: [N, L, Hkv, D]
       - summary_vecs  : [N, Hkv*D]
-
-    方向 D：若 crypto_ctx 启用，写完明文后立即加密为
-    retrieval_index.safetensors.enc 并删除明文。
-    这样 Host 侧磁盘上只有密文，KV 向量的语义信息不泄露到 TDX 外部。
     """
     if not chunk_indices:
         return
@@ -154,29 +150,6 @@ def _write_retrieval_index(kv_cache_dir, chunk_indices, layer_key_vecs, summary_
     metadata_str = {k: json.dumps(v, ensure_ascii=False) for k, v in metadata.items()}
     save_file(tensors, index_path, metadata=metadata_str)
     print(f"Retrieval index saved to {index_path}")
-
-    # ── 方向 D：加密 retrieval_index，防止语义信息在 TDX 外泄露 ─────────────
-    if crypto_ctx is not None and getattr(crypto_ctx, "enabled", False):
-        try:
-            from kvcache_crypto_td import encrypt_bytes_to_blob
-            enc_path = index_path + ".enc"
-            plaintext = open(index_path, "rb").read()
-            # chunk_index=-1 作为 retrieval_index 的专属 HKDF 派生标识
-            blob = encrypt_bytes_to_blob(
-                plaintext,
-                crypto_ctx.master_key,
-                chunk_index=-1,
-                aad={"file": "retrieval_index", "num_chunks": len(chunk_indices)},
-            )
-            # 原子写入
-            tmp_path = enc_path + ".tmp"
-            with open(tmp_path, "wb") as f:
-                f.write(blob)
-            os.replace(tmp_path, enc_path)
-            os.unlink(index_path)   # 删除明文
-            print(f"[crypto/D] retrieval_index encrypted → {os.path.basename(enc_path)} (plaintext deleted)")
-        except Exception as e:
-            print(f"[crypto/D] WARNING: retrieval_index encryption failed: {e}. Plaintext retained.")
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +216,8 @@ def encode_video(
     crypto_ctx=None,        # 可选：kvcache_crypto_td.CryptoContext
     max_in_memory: int = 64,
     window_size: Optional[int] = None,
+    i_frame_interval: int = 0,      # 方向 B：关键帧间隔，0=禁用 Delta 压缩
+    delta_threshold: float = 1e-3,  # 方向 B：差分量化阈值
 ):
     """
     将视频分块编码成 KV cache。
@@ -256,6 +231,15 @@ def encode_video(
         KV cache 加密上下文（kvcache_crypto_td.CryptoContext）。
         None 或 enabled=False 时不加密。每个 chunk shard 保存后立即加密，
         删除明文，decode 侧透明解密。
+    i_frame_interval : int
+        Delta KV 压缩（方向 B）的关键帧间隔。
+          0  = 禁用（全部存 I 帧，原有行为）
+          N  = 每 N 帧一个 I 帧，其余帧存 P 帧（差分）。
+        推荐值：8~32。值越大压缩率越高，decode 重建链越长。
+    delta_threshold : float
+        P 帧差分量化阈值。绝对值小于此值的差分元素被置零（稀疏化）。
+        越大 → 稀疏率越高 → 压缩率越高 → 重建误差越大。
+        推荐范围：1e-4（高精度）~ 1e-2（高压缩）。
 
     行为说明
     --------
@@ -535,23 +519,79 @@ def encode_video(
                         "model_name_or_path": getattr(model.config, "_name_or_path", None),
                         "window_size": window_size,
                         "storage_format": "kvpack_mmap_v1",
+                        "i_frame_interval": int(i_frame_interval),
+                        "delta_threshold": float(delta_threshold),
                     }
 
-                # layer-frame 粒度落盘：每个 frame chunk 的每一层单独一个 block
+                # ── 方向 B：判断当前帧应存 I 帧还是 P 帧 ──────────────────
+                use_delta = (
+                    i_frame_interval > 0
+                    and i % i_frame_interval != 0     # 非关键帧位置
+                    and i > 0                          # 第 0 帧始终为 I 帧
+                )
+
+                # 找参考 I 帧（本 GOP 内最近的 I 帧）
+                if use_delta:
+                    ref_frame_idx = (i // i_frame_interval) * i_frame_interval
+                    if ref_frame_idx not in frame_cache:
+                        # 参考帧已被逐出内存，需从 mmap 回读
+                        reader_tmp = KVPackReader(kv_cache_dir) if KVPackReader is not None else None
+                        if reader_tmp is not None:
+                            _ref_kv = []
+                            for li in range(len(delta_kv)):
+                                k_r, v_r, _ = reader_tmp.read_layer_frame(li, ref_frame_idx, decrypt_fn=None)
+                                _ref_kv.append((k_r, v_r))
+                            frame_cache[ref_frame_idx] = tuple(_ref_kv)
+                            reader_tmp.close()
+                        else:
+                            use_delta = False   # 回退到 I 帧
+
+                # ── 写盘：I 帧或 P 帧 ─────────────────────────────────────
+                total_payload_bytes = 0
+                total_orig_bytes = 0
+
                 for layer_idx, (layer_k, layer_v) in enumerate(delta_kv):
-                    rec = pack_writer.append_block(
-                        frame_index=i,
-                        layer_index=layer_idx,
-                        seq_start=int(past_kv_seq_len),
-                        seq_end=int(full_kv_seq_len),
-                        key_tensor=layer_k,
-                        value_tensor=layer_v,
-                        encrypt_fn=encrypt_payload_fn,
-                    )
+                    if use_delta and ref_frame_idx in frame_cache:
+                        _, ref_v = frame_cache[ref_frame_idx][layer_idx]
+                        rec = pack_writer.append_p_block(
+                            frame_index=i,
+                            layer_index=layer_idx,
+                            seq_start=int(past_kv_seq_len),
+                            seq_end=int(full_kv_seq_len),
+                            key_tensor=layer_k,
+                            value_tensor=layer_v,
+                            ref_value_tensor=ref_v,
+                            ref_frame_index=ref_frame_idx,
+                            delta_threshold=delta_threshold,
+                            encrypt_fn=encrypt_payload_fn,
+                        )
+                    else:
+                        rec = pack_writer.append_block(
+                            frame_index=i,
+                            layer_index=layer_idx,
+                            seq_start=int(past_kv_seq_len),
+                            seq_end=int(full_kv_seq_len),
+                            key_tensor=layer_k,
+                            value_tensor=layer_v,
+                            encrypt_fn=encrypt_payload_fn,
+                        )
+
                     rec["chunk_index"] = int(i)
                     rec["block_index"] = len(chunk_records)
                     rec["delta_seq_len"] = int(delta_seq_len)
                     chunk_records.append(rec)
+                    total_payload_bytes += int(rec["payload_len"])
+                    total_orig_bytes += layer_k.numel() * layer_k.element_size() * 2
+
+                # 压缩统计 log
+                frame_type = "P" if use_delta else "I"
+                ratio = total_payload_bytes / total_orig_bytes if total_orig_bytes > 0 else 1.0
+                print(
+                    f"[delta:B] frame={i} type={frame_type}  "
+                    f"payload={total_payload_bytes//1024}KB / orig={total_orig_bytes//1024}KB  "
+                    f"ratio={ratio:.3f}"
+                    + (f"  ref={ref_frame_idx}" if use_delta else "")
+                )
 
                 retrieval_chunk_indices.append(i)
                 retrieval_layer_key_vecs.append(chunk_layer_key_vec.cpu().contiguous())
@@ -587,7 +627,6 @@ def encode_video(
             retrieval_layer_key_vecs,
             retrieval_summary_vecs,
             common_metadata,
-            crypto_ctx=crypto_ctx,
         )
 
     return None

@@ -36,6 +36,7 @@ run_encode_encrypt(){
     --mode "encode" --chunk_size $chunk_size --encode_memory $encode_memory --encode_window $encode_window \
     --plot_file "../results/plots/${name}.png"   \
     --encrypt \
+    --delta_interval 0 --delta_threshold 0.1 \
     > ../results/logs/${name}.log 2>&1
 }
 

@@ -25,6 +25,10 @@ if __name__ == "__main__":
     parser.add_argument("--chunk_size", type=int, default=1)
     parser.add_argument("--encode_memory", type=int, default=64)
     parser.add_argument("--encode_window", type=int, default=0)
+    parser.add_argument("--delta_interval", type=int, default=0,
+                        help="Delta KV 关键帧间隔（方向B）。0=禁用，推荐8~32。")
+    parser.add_argument("--delta_threshold", type=float, default=1e-2,
+                        help="P帧差分量化阈值（方向B）。推荐1e-4~1e-2。")
     parser.add_argument("--decode_select", type=int, default=0)
 
     # ── 剪枝参数 ──────────────────────────────────────────────────────────
@@ -43,15 +47,16 @@ if __name__ == "__main__":
     # ── 加密参数 ──────────────────────────────────────────────────────────
     parser.add_argument("--encrypt", action="store_true",
                         help="启用 KV cache 加密（encode 时加密，decode 时自动解密）")
+    parser.add_argument("--encrypt_key", type=str, default="../data/master.key",
+                        help="master key 文件路径（首次运行自动生成）")
 
     args = parser.parse_args()
 
     model_path    = "llava-hf/llava-onevision-qwen2-7b-ov-hf"
-    video_path    = "../data/haimian_7.mp4"
+    video_path    = "../data/muffin_static.mp4"
     kv_cache_path = "../data/kv_cache_chunks"
     question      = "Who is in the video, and what are they doing?"
     encode_prefix = "You are a helpful assistant. Please understand the video content and prepare to answer single-choice questions."
-    key_file       = "../data/master.key"
 
     # ── 构建 PruneContext（encode 侧使用）────────────────────────────────
     prune_ctx = None
@@ -74,11 +79,8 @@ if __name__ == "__main__":
     crypto_ctx = None
     if args.encrypt:
         from kvcache_crypto_td import CryptoContext
-        crypto_ctx = CryptoContext.from_key_file(
-            key_file,
-            create=True,
-        )
-        logger.info(f"[crypto] Encryption enabled. Key file: {key_file}")
+        crypto_ctx = CryptoContext.from_key_file(args.encrypt_key, create=True)
+        logger.info(f"[crypto] Encryption enabled. Key file: {args.encrypt_key}")
 
     with measure_resources(args.mode, logger=logger, plot_file=args.plot_file, plot_lable=True) as monitor:
         # ── 编码阶段 ──────────────────────────────────────────────────────────
@@ -88,7 +90,7 @@ if __name__ == "__main__":
             processor, model = load_model(model_path, load_weights=True)
             inject_timing_hook_to_model(model, event_callback=monitor["mark"])
 
-            video = load_video(video_path, sample_fps=0.5)
+            video = load_video(video_path, sample_fps=10)
 
             monitor["mark"]("kvcache_encode_start")
             encode_video(
@@ -103,6 +105,8 @@ if __name__ == "__main__":
                 crypto_ctx=crypto_ctx,
                 max_in_memory=args.encode_memory,
                 window_size=args.encode_window if args.encode_window > 0 else None,
+                i_frame_interval=args.delta_interval,
+                delta_threshold=args.delta_threshold,
             )
             monitor["mark"]("kvcache_encode_done")
 
