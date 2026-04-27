@@ -7,6 +7,7 @@ from typing import Optional
 
 import gc
 import torch
+import numpy as np
 from decord import VideoReader, cpu
 from safetensors.torch import save_file
 from transformers import LlavaOnevisionForConditionalGeneration as LlavaOV
@@ -201,7 +202,7 @@ def _encode_and_save_prefix(encode_prefix, processor, model, kv_cache_dir, devic
 
 
 # ---------------------------------------------------------------------------
-# encode_video — 支持 KVCacheManager（可选）
+# encode_video — 带自适应 PV 差分存储
 # ---------------------------------------------------------------------------
 
 def encode_video(
@@ -212,12 +213,13 @@ def encode_video(
     encode_prefix=None,
     stage_mark=None,
     kv_cache_dir=None,
-    prune_ctx=None,         # 可选：video_token_prune_td.PruneContext
-    crypto_ctx=None,        # 可选：kvcache_crypto_td.CryptoContext
+    prune_ctx=None,               # 可选：video_token_prune_td.PruneContext
+    crypto_ctx=None,              # 可选：kvcache_crypto_td.CryptoContext
     max_in_memory: int = 64,
     window_size: Optional[int] = None,
-    i_frame_interval: int = 0,      # 方向 B：关键帧间隔，0=禁用 Delta 压缩
-    delta_threshold: float = 1e-3,  # 方向 B：差分量化阈值
+    max_consecutive_p: int = 0,         # 每层最大连续 P 帧数（0=禁用差分）
+    delta_threshold: float = 1e-3,      # V 差分量化阈值
+    delta_ratio_threshold: float = 0.75 # 自适应回退 I 帧的稀疏率上限
 ):
     """
     将视频分块编码成 KV cache。
@@ -231,22 +233,12 @@ def encode_video(
         KV cache 加密上下文（kvcache_crypto_td.CryptoContext）。
         None 或 enabled=False 时不加密。每个 chunk shard 保存后立即加密，
         删除明文，decode 侧透明解密。
-    i_frame_interval : int
-        Delta KV 压缩（方向 B）的关键帧间隔。
-          0  = 禁用（全部存 I 帧，原有行为）
-          N  = 每 N 帧一个 I 帧，其余帧存 P 帧（差分）。
-        推荐值：8~32。值越大压缩率越高，decode 重建链越长。
+    max_consecutive_p : int
+        每层允许的最大连续 PV 帧数，到达后自动插入 I 帧（0 禁用差分压缩）。
     delta_threshold : float
-        P 帧差分量化阈值。绝对值小于此值的差分元素被置零（稀疏化）。
-        越大 → 稀疏率越高 → 压缩率越高 → 重建误差越大。
-        推荐范围：1e-4（高精度）~ 1e-2（高压缩）。
-
-    行为说明
-    --------
-    本函数已移除旧的 safetensors manager 调度体系，统一采用 kvpack_mmap_v1：
-      - 按 frame×layer block 追加写入 kvpack.bin
-      - 编码阶段 past_kv 由「内存缓存 + mmap 回读」拼装
-      - window_size 控制仅保留最近 W 帧上下文（None 表示全历史）
+        PV 帧 V 差分量化阈值，绝对值小于此值置零。
+    delta_ratio_threshold : float
+        V 差分非零比例阈值，若超过此值则放弃使用 PV 帧，直接存 I 帧。
     """
     num_frames = video.shape[0]
     num_chunks = (num_frames + chunk_size - 1) // chunk_size
@@ -260,6 +252,7 @@ def encode_video(
     if kv_cache_dir is not None:
         os.makedirs(kv_cache_dir, exist_ok=True)
         pack_writer = KVPackWriter(kv_cache_dir)
+
     # 帧级缓存：frame_idx -> tuple[L](k,v)
     frame_cache = {}
     frame_order = []
@@ -289,8 +282,6 @@ def encode_video(
         encrypt_payload_fn = _encrypt_payload
 
     # ---- 前缀单独编码 ----
-    # encode_prefix 文字 token 的 KV 存为 prefix_cache.safetensors；
-    # 各 chunk shard 只存视频 visual token 的 delta KV。
     prefix_kv = None
     prefix_seq_len = 0
     if model is not None:
@@ -301,11 +292,14 @@ def encode_video(
         )
     full_merged_seq_len = int(prefix_seq_len)
 
-    # ---- 剪枝说明 ────────────────────────────────────────────────────────
+    # ---- 剪枝说明 ────────────────────────────────────────────────────
     # Level 0 temporal: 在 processor 之前减少帧数（有效）
     # Level 1 spatial:  在 processor 之前降低分辨率（有效）
     # ⚠️  mid-forward hook spatial 已移除（不兼容 LLaVA-OV attention_mask 预构建）
-    # ────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────
+
+    # 各层连续 P 帧计数，将在第一次获得 delta_kv 后初始化
+    layer_p_count = None
 
     try:
         for i in range(num_chunks):
@@ -315,23 +309,13 @@ def encode_video(
 
             frames_before_prune = len(chunk)
 
-            # ---- Level-0 帧级时序去冗余（在 processor 之前，纯 numpy）----
+            # ---- 剪枝 ----
             if prune_ctx is not None:
-                from video_prune import temporal_filter_chunk
+                from video_prune import temporal_filter_chunk, spatial_downscale_chunk
                 chunk = temporal_filter_chunk(chunk, prune_ctx, chunk_idx=i)
                 if len(chunk) == 0:
                     print(f"[prune] chunk {i}: all frames filtered, skipping.")
                     continue
-                if len(chunk) != frames_before_prune:
-                    print(
-                        f"[prune:temporal] chunk {i}: "
-                        f"{frames_before_prune} → {len(chunk)} frames "
-                        f"({len(chunk)/frames_before_prune:.0%} kept)"
-                    )
-
-            # ---- Level-1 像素级降分辨率（在 processor 之前，Pillow resize）----
-            if prune_ctx is not None:
-                from video_prune import spatial_downscale_chunk
                 chunk = spatial_downscale_chunk(chunk, prune_ctx, chunk_idx=i)
 
             pixel_values = processor.video_processor(chunk, return_tensors="pt").pixel_values_videos.to("cpu")
@@ -340,8 +324,6 @@ def encode_video(
             if model is None:
                 continue
 
-            # 所有 chunk 都只用 VIDEO_PLACEHOLDER；
-            # encode_prefix 已单独 forward 并存为 prefix_cache.safetensors。
             encode_text = VIDEO_PLACEHOLDER
 
             model_inputs = processor(
@@ -356,13 +338,10 @@ def encode_video(
                 for k, v in model_inputs.items()
             }
 
-            # ----------------------------------------------------------------
-            # 决定传给 model 的 past_key_values 及 attention_mask
-            # 所有模式均将 prefix_kv 拼在窗口/全量 KV 之前。
-            # ----------------------------------------------------------------
+            # ------------------------------------------------------------
+            # 构建 past_kv
             from kvcache_retrieve_td import _concat_kv_segments as _cat_kv
             def _prepend_prefix(base_kv, base_seq_len):
-                """将 prefix_kv 拼到 base_kv 前面，返回 (merged_kv, merged_seq_len)。"""
                 if prefix_kv is None:
                     return (base_kv, base_seq_len)
                 if base_kv is None:
@@ -372,11 +351,9 @@ def encode_video(
                 merged = _cat_kv([pkv, base_kv])
                 return (merged, int(merged[0][0].shape[-2]))
 
-            # 构建需要的历史帧集合
             history_frames = list(range(i))
             if window_size is not None and window_size > 0:
                 history_frames = history_frames[-int(window_size):]
-            # 尝试从内存缓存取，不足时从 mmap pack 回读
             base_kv = None
             if history_frames:
                 segments = []
@@ -409,21 +386,9 @@ def encode_video(
                     device=device,
                 )
 
-            print(f"[chunk {i}] encode_text: {repr(encode_text)}")
-            print(f"[chunk {i}] past_kv_seq_len (passed to model): {past_kv_seq_len}")
-            print(f"[chunk {i}] current_text_len: {current_text_len}")
-            for k, v in model_inputs.items():
-                if isinstance(v, torch.Tensor):
-                    print(f"[chunk {i}] model_inputs[{k}] shape: {tuple(v.shape)}")
-
-            # ----------------------------------------------------------------
-            # 捕获 pre-RoPE K 向量（用于 retrieval_index，内容相关性检索）
-            # 注意：delta_kv 里的 K 是 post-RoPE（绝对位置已烘入），
-            # 不同 chunk 的绝对位置差距数万，cosine sim 会被位置主导。
-            # 用 hook 在 k_proj 输出后、apply_rotary_pos_emb 之前捕获，
-            # 得到纯内容相关的 K 向量，可与 select 侧的 pre-RoPE Q 比较。
-            # ----------------------------------------------------------------
-            _pre_rope_k_layers = []   # [Hkv, D] per layer
+            # ------------------------------------------------------------
+            # 捕获 pre-RoPE K（用于检索索引）
+            _pre_rope_k_layers = []
             _hook_handles_k = []
 
             def _make_k_capture():
@@ -460,12 +425,8 @@ def encode_video(
 
             full_kv_after = outputs.past_key_values
 
-            # ----------------------------------------------------------------
-            # 提取本 chunk 的 delta KV（新增的 token 部分）
-            # delta = [past_kv_seq_len:] 即本 chunk 新增的 merged token 的 KV
-            # 注意：.detach().cpu().contiguous() 会创建全新 tensor，与 full_kv_after
-            # 无共享存储，之后可以安全释放 outputs / full_kv_after。
-            # ----------------------------------------------------------------
+            # ------------------------------------------------------------
+            # 提取本 chunk 的 delta KV
             if full_kv_after:
                 full_kv_seq_len = int(full_kv_after[0][0].shape[-2])
                 delta_kv = tuple(
@@ -477,38 +438,22 @@ def encode_video(
                 )
                 delta_seq_len = int(delta_kv[0][0].shape[-2])
 
-                # ---- chunk summary vector（pre-RoPE K，供 select 检索）----
+                # chunk summary
                 if not _pre_rope_k_layers:
-                    raise RuntimeError(
-                        f"[chunk {i}] failed to capture pre-RoPE K vectors; aborting in strict mode."
-                    )
-                chunk_layer_key_vec = torch.stack(_pre_rope_k_layers, dim=0).float()  # [L, Hkv, D]
+                    raise RuntimeError(f"[chunk {i}] failed to capture pre-RoPE K vectors.")
+                chunk_layer_key_vec = torch.stack(_pre_rope_k_layers, dim=0).float()
                 _pre_rope_k_layers.clear()
-
                 chunk_summary_vec = chunk_layer_key_vec.mean(dim=0).flatten().float()
 
-                print(f"[chunk {i}] full_kv_seq_len: {full_kv_seq_len}")
-                print(f"[chunk {i}] delta_seq_len (this chunk merged): {delta_seq_len}")
-                print(f"[chunk {i}] summary_vec shape: {tuple(chunk_summary_vec.shape)}")
-
                 full_merged_seq_len += delta_seq_len
-
             else:
                 delta_kv = None
                 full_kv_seq_len = 0
                 delta_seq_len = 0
                 chunk_summary_vec = None
 
-            # ----------------------------------------------------------------
-            # 显式释放大对象引用，让 GC 能立即回收 tensor 内存
-            # outputs      → 持有整个 model forward 结果（含全量 KV）
-            # full_kv_after → 全量累积 KV 的直接引用
-            # past_kv      → 本轮传给 model 的窗口/全量 KV concat 结果
-            # model_inputs → 含 pixel_values 等大型 tensor
-            # ----------------------------------------------------------------
-            # ----------------------------------------------------------------
+            # ------------------------------------------------------------
             # 保存 delta 到磁盘 & 更新状态
-            # ----------------------------------------------------------------
             if kv_cache_dir is not None and delta_kv is not None:
                 if not common_metadata:
                     common_metadata = {
@@ -519,41 +464,38 @@ def encode_video(
                         "model_name_or_path": getattr(model.config, "_name_or_path", None),
                         "window_size": window_size,
                         "storage_format": "kvpack_mmap_v1",
-                        "i_frame_interval": int(i_frame_interval),
+                        "max_consecutive_p": int(max_consecutive_p),
                         "delta_threshold": float(delta_threshold),
+                        "delta_ratio_threshold": float(delta_ratio_threshold),
                     }
 
-                # ── 方向 B：判断当前帧应存 I 帧还是 P 帧 ──────────────────
-                use_delta = (
-                    i_frame_interval > 0
-                    and i % i_frame_interval != 0     # 非关键帧位置
-                    and i > 0                          # 第 0 帧始终为 I 帧
-                )
+                # 初始化各层 P 计数
+                if layer_p_count is None:
+                    layer_p_count = [0] * len(delta_kv)
 
-                # 找参考 I 帧（本 GOP 内最近的 I 帧）
-                if use_delta:
-                    ref_frame_idx = (i // i_frame_interval) * i_frame_interval
-                    if ref_frame_idx not in frame_cache:
-                        # 参考帧已被逐出内存，需从 mmap 回读
-                        reader_tmp = KVPackReader(kv_cache_dir) if KVPackReader is not None else None
-                        if reader_tmp is not None:
-                            _ref_kv = []
-                            for li in range(len(delta_kv)):
-                                k_r, v_r, _ = reader_tmp.read_layer_frame(li, ref_frame_idx, decrypt_fn=None)
-                                _ref_kv.append((k_r, v_r))
-                            frame_cache[ref_frame_idx] = tuple(_ref_kv)
-                            reader_tmp.close()
-                        else:
-                            use_delta = False   # 回退到 I 帧
-
-                # ── 写盘：I 帧或 P 帧 ─────────────────────────────────────
                 total_payload_bytes = 0
                 total_orig_bytes = 0
+                p_layer_count_this_frame = 0
+                i_layers = []                         # <-- 新增
 
                 for layer_idx, (layer_k, layer_v) in enumerate(delta_kv):
-                    if use_delta and ref_frame_idx in frame_cache:
-                        _, ref_v = frame_cache[ref_frame_idx][layer_idx]
-                        rec = pack_writer.append_p_block(
+                    use_p = False
+                    ref_v = None
+                    ref_frame = None
+
+                    if max_consecutive_p > 0 and i > 0 and layer_p_count[layer_idx] < max_consecutive_p:
+                        prev_kv = frame_cache.get(i - 1)
+                        if prev_kv is not None:
+                            ref_v = prev_kv[layer_idx][1]
+                            delta_v = (layer_v.float() - ref_v.float()).numpy()
+                            nnz_v = int(np.sum(np.abs(delta_v.ravel()) > delta_threshold))
+                            ratio_v = nnz_v / delta_v.size if delta_v.size > 0 else 1.0
+                            if ratio_v <= delta_ratio_threshold:
+                                use_p = True
+                                ref_frame = i - 1
+
+                    if use_p:
+                        rec = pack_writer.append_p_block(      
                             frame_index=i,
                             layer_index=layer_idx,
                             seq_start=int(past_kv_seq_len),
@@ -561,12 +503,14 @@ def encode_video(
                             key_tensor=layer_k,
                             value_tensor=layer_v,
                             ref_value_tensor=ref_v,
-                            ref_frame_index=ref_frame_idx,
+                            ref_frame_index=ref_frame,
                             delta_threshold=delta_threshold,
                             encrypt_fn=encrypt_payload_fn,
                         )
+                        layer_p_count[layer_idx] += 1
+                        p_layer_count_this_frame += 1
                     else:
-                        rec = pack_writer.append_block(
+                        rec = pack_writer.append_block(        
                             frame_index=i,
                             layer_index=layer_idx,
                             seq_start=int(past_kv_seq_len),
@@ -575,34 +519,41 @@ def encode_video(
                             value_tensor=layer_v,
                             encrypt_fn=encrypt_payload_fn,
                         )
+                        layer_p_count[layer_idx] = 0
+                        i_layers.append(layer_idx)
+
+                    total_payload_bytes += int(rec["payload_len"])
+                    total_orig_bytes += layer_k.numel() * layer_k.element_size() * 2
 
                     rec["chunk_index"] = int(i)
                     rec["block_index"] = len(chunk_records)
                     rec["delta_seq_len"] = int(delta_seq_len)
                     chunk_records.append(rec)
-                    total_payload_bytes += int(rec["payload_len"])
-                    total_orig_bytes += layer_k.numel() * layer_k.element_size() * 2
 
-                # 压缩统计 log
-                frame_type = "P" if use_delta else "I"
                 ratio = total_payload_bytes / total_orig_bytes if total_orig_bytes > 0 else 1.0
+                total_layers = len(delta_kv)
                 print(
-                    f"[delta:B] frame={i} type={frame_type}  "
+                    f"[delta:B] frame={i}  "
+                    f"P-layers={p_layer_count_this_frame}/{total_layers}  "
                     f"payload={total_payload_bytes//1024}KB / orig={total_orig_bytes//1024}KB  "
                     f"ratio={ratio:.3f}"
-                    + (f"  ref={ref_frame_idx}" if use_delta else "")
                 )
+                if i_layers:                            # <-- 新增
+                    print(f"  [delta:B] frame={i} I-layers ({len(i_layers)}): {i_layers}")
 
                 retrieval_chunk_indices.append(i)
                 retrieval_layer_key_vecs.append(chunk_layer_key_vec.cpu().contiguous())
                 retrieval_summary_vecs.append(chunk_summary_vec.cpu().contiguous())
-                frame_cache[i] = tuple((k.cpu().contiguous(), v.cpu().contiguous()) for k, v in delta_kv)
+                frame_cache[i] = tuple(
+                    (k.cpu().contiguous(), v.cpu().contiguous()) for k, v in delta_kv
+                )
                 frame_order.append(i)
                 while len(frame_order) > max_in_memory:
                     old = frame_order.pop(0)
                     if old in frame_cache:
                         del frame_cache[old]
 
+            # 释放大对象
             del outputs, full_kv_after
             if past_kv is not None:
                 del past_kv
@@ -614,8 +565,6 @@ def encode_video(
             print(prune_ctx.summary())
 
     if kv_cache_dir is not None:
-        # 把真实的 full_merged_seq_len 写入 common_metadata，
-        # retrieve 侧直接读取，无需从 delta_seq_len 反推。
         common_metadata["full_merged_seq_len"] = int(full_merged_seq_len)
         if pack_writer is not None:
             pack_writer.write_index(common_metadata)

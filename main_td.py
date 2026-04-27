@@ -2,6 +2,8 @@ import os
 import gc
 import time
 import argparse
+import logging
+import sys
 
 from kvcache_generate_td import load_model, load_video, encode_video
 from kvcache_retrieve_td import decode_kvcache
@@ -25,40 +27,41 @@ if __name__ == "__main__":
     parser.add_argument("--chunk_size", type=int, default=1)
     parser.add_argument("--encode_memory", type=int, default=64)
     parser.add_argument("--encode_window", type=int, default=0)
-    parser.add_argument("--delta_interval", type=int, default=0,
-                        help="Delta KV 关键帧间隔（方向B）。0=禁用，推荐8~32。")
-    parser.add_argument("--delta_threshold", type=float, default=1e-2,
-                        help="P帧差分量化阈值（方向B）。推荐1e-4~1e-2。")
-    parser.add_argument("--decode_select", type=int, default=0)
 
-    # ── 剪枝参数 ──────────────────────────────────────────────────────────
+    # 差分压缩参数（方向 B）
+    parser.add_argument("--delta_max_p", type=int, default=0,
+                        help="Max consecutive P-frames per layer (0=disable delta).")
+    parser.add_argument("--delta_threshold", type=float, default=1e-3,
+                        help="V delta sparse quantization threshold.")
+    parser.add_argument("--delta_ratio_threshold", type=float, default=0.75,
+                        help="Max V delta nnz ratio to keep P-frame, else fallback to I.")
+
+    parser.add_argument("--decode_select", type=int, default=0,
+                        help="Number of chunks to select (0=all, use per-layer if >0).")
+
+    # 剪枝参数
     parser.add_argument("--prune", action="store_true",
-                        help="启用视频 token 剪枝（encode 时启用，decode 时自动兼容）")
+                        help="Enable video token pruning.")
     parser.add_argument("--prune_temporal", type=float, default=0.0,
-                        help="帧级时序去冗余：目标保留帧比例（0~1）。"
-                             "0 = 不启用。0.6 = 每 chunk 保留约 60%% 的帧。"
-                             "内部自动推算 cosine 阈值并在日志中打印。推荐 0.4~0.8。")
+                        help="Temporal frame keep ratio (0~1).")
     parser.add_argument("--prune_spatial", type=float, default=0.0,
-                        help="空间降分辨率：像素面积保留比例（0~1）。"
-                             "0 = 不启用。0.5 = 面积缩小至 50%%（长宽各 ×√0.5≈0.707），保留宽高比。"
-                             "推荐 0.3~0.7。")
-    # 在目前的模型llava-onevision下，空间剪枝是无效的，因为分辨率不随着输入视频分辨率的变化而变化，而是固定的384*384
+                        help="Spatial downscale ratio (0~1).")
 
-    # ── 加密参数 ──────────────────────────────────────────────────────────
+    # 加密参数
     parser.add_argument("--encrypt", action="store_true",
-                        help="启用 KV cache 加密（encode 时加密，decode 时自动解密）")
-    parser.add_argument("--encrypt_key", type=str, default="../data/master.key",
-                        help="master key 文件路径（首次运行自动生成）")
+                        help="Enable KV cache encryption.")
+    parser.add_argument("--key_file", type=str, default="../data/master.key",
+                        help="Master key file path.")
 
     args = parser.parse_args()
 
     model_path    = "llava-hf/llava-onevision-qwen2-7b-ov-hf"
-    video_path    = "../data/muffin_static.mp4"
+    video_path    = "../data/haimian_7.mp4"
     kv_cache_path = "../data/kv_cache_chunks"
     question      = "Who is in the video, and what are they doing?"
     encode_prefix = "You are a helpful assistant. Please understand the video content and prepare to answer single-choice questions."
 
-    # ── 构建 PruneContext（encode 侧使用）────────────────────────────────
+    # Prune context
     prune_ctx = None
     if args.prune and (args.prune_temporal > 0 or args.prune_spatial > 0):
         from video_prune import PruneContext
@@ -70,27 +73,23 @@ if __name__ == "__main__":
             spatial_ratio=args.prune_spatial if args.prune_spatial > 0 else None,
             log_stats=True,
         )
-        logger.info(
-            f"[prune] Enabled: temporal_keep_ratio={args.prune_temporal}, "
-            f"spatial_ratio={args.prune_spatial}"
-        )
+        logger.info(f"[prune] temporal={args.prune_temporal}, spatial={args.prune_spatial}")
 
-    # ── 构建 CryptoContext（encode/decode 双侧使用）───────────────────────
+    # Crypto context
     crypto_ctx = None
     if args.encrypt:
         from kvcache_crypto_td import CryptoContext
-        crypto_ctx = CryptoContext.from_key_file(args.encrypt_key, create=True)
-        logger.info(f"[crypto] Encryption enabled. Key file: {args.encrypt_key}")
+        crypto_ctx = CryptoContext.from_key_file(args.key_file, create=True)
+        logger.info(f"[crypto] Encryption enabled, key file: {args.key_file}")
 
     with measure_resources(args.mode, logger=logger, plot_file=args.plot_file, plot_lable=True) as monitor:
-        # ── 编码阶段 ──────────────────────────────────────────────────────────
+        # ── 编码阶段 ──
         if args.mode in ("encode_decode", "encode"):
-
             monitor["mark"]("load_model_encode")
             processor, model = load_model(model_path, load_weights=True)
             inject_timing_hook_to_model(model, event_callback=monitor["mark"])
 
-            video = load_video(video_path, sample_fps=10)
+            video = load_video(video_path, sample_fps=0.5)
 
             monitor["mark"]("kvcache_encode_start")
             encode_video(
@@ -105,8 +104,9 @@ if __name__ == "__main__":
                 crypto_ctx=crypto_ctx,
                 max_in_memory=args.encode_memory,
                 window_size=args.encode_window if args.encode_window > 0 else None,
-                i_frame_interval=args.delta_interval,
+                max_consecutive_p=args.delta_max_p,
                 delta_threshold=args.delta_threshold,
+                delta_ratio_threshold=args.delta_ratio_threshold,
             )
             monitor["mark"]("kvcache_encode_done")
 
@@ -115,7 +115,7 @@ if __name__ == "__main__":
             gc.collect()
             time.sleep(10)
 
-        # ── 解码阶段 ──────────────────────────────────────────────────────────
+        # ── 解码阶段 ──
         if args.mode in ("encode_decode", "decode"):
             monitor["mark"]("load_model_decode")
             processor, model = load_model(model_path, load_weights=True)
@@ -124,32 +124,26 @@ if __name__ == "__main__":
             text_content = f"Question: {question}\nAnswer:"
             conversation_context = [{
                 "role": "user",
-                "content": [{
-                    "type": "text", "text": text_content
-                }],
+                "content": [{"type": "text", "text": text_content}],
             }]
             prompt = processor.apply_chat_template(
                 conversation_context,
-                add_generation_prompt = True,
+                add_generation_prompt=True,
                 tokenize=False,
             )
 
-            print("======================================================")
-            print(f"decode_select：{args.decode_select}")
-            print("添加chat_template后Prompt为：")
-            print(prompt)
+            logger.info(f"decode_select={args.decode_select}")
 
             if args.decode_select > 0:
-                #decode_chunk_ids = select_chunks(
                 decode_chunk_ids = select_chunks_per_layer(
-                    kv_cache_path, 
-                    question, 
-                    processor, 
-                    model, 
+                    kv_cache_path,
+                    question,
+                    processor,
+                    model,
                     top_k=args.decode_select,
-                    crypto_ctx=crypto_ctx,   # 方向D：retrieval_index 可能已加密
+                    crypto_ctx=crypto_ctx,
                 )
-                logger.info(f"Decoding with top-{args.decode_select} selected chunks.")
+                logger.info(f"Decoding with top-{args.decode_select} per-layer chunks.")
             else:
                 decode_chunk_ids = None
                 logger.info("Decoding with all chunks.")
@@ -164,19 +158,17 @@ if __name__ == "__main__":
                 min_new_tokens=1,
                 temperature=0.0,
                 decode_strategy="sample",
-                #chunk_indices=decode_chunk_ids,
                 suffix=prompt,
-                crypto_ctx=crypto_ctx,  # ← 自动解密
-                per_layer_chunk_indices = decode_chunk_ids,
+                crypto_ctx=crypto_ctx,
+                per_layer_chunk_indices=decode_chunk_ids,
             )
 
-            print(f"model answer: {answer}")
+            logger.info(f"Model answer: {answer}")
 
             remove_timing_hooks_from_model()
             del model
             gc.collect()
             time.sleep(10)
 
-        # 解码完成后清理解密临时文件
         if crypto_ctx is not None:
             crypto_ctx.cleanup_tmp()
