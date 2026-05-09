@@ -117,7 +117,8 @@ def run_host(kv_dir: str, verbose: bool = False) -> None:
     # ── offload 侧：顺序追加写文件句柄 ──────────────────────────────────
     bin_path   = os.path.join(kv_dir, "kvpack.bin")
     index_path = os.path.join(kv_dir, "kvpack_index.json")
-    offload_f  = open(bin_path, "wb")   # 追加写
+    # 延迟打开：避免 host 启动后 TD 侧清理目录导致 fd 指向已删除 inode。
+    offload_f  = None
     records    = []   # 接收 TD 推来的 index 记录
 
     # ── fetch 侧：decode 阶段 mmap 读句柄（优先尝试从磁盘恢复）────────────
@@ -150,6 +151,10 @@ def run_host(kv_dir: str, verbose: bool = False) -> None:
             # ── OFFLOAD：encode 阶段 TD 推一个 block ─────────────────────
             if status == STATUS_OFFLOAD_READY:
                 try:
+                    if offload_f is None:
+                        os.makedirs(kv_dir, exist_ok=True)
+                        offload_f = open(bin_path, "wb")
+                        print(f"[host] OFFLOAD sink opened: {bin_path}")
                     raw = bytes(mm[PAGESIZE : PAGESIZE + dlen])
                     file_offset = offload_f.tell()
                     offload_f.write(raw)
@@ -184,9 +189,15 @@ def run_host(kv_dir: str, verbose: bool = False) -> None:
             # ── FINALIZE：encode 结束，写 kvpack_index.json ───────────────
             elif status == STATUS_FINALIZE_READY:
                 try:
+                    if offload_f is None:
+                        # 允许“仅 FINALIZE”恢复场景：没有任何 OFFLOAD 也可产出空索引。
+                        os.makedirs(kv_dir, exist_ok=True)
+                        offload_f = open(bin_path, "wb")
+                        print(f"[host] FINALIZE with empty OFFLOAD stream, created {bin_path}")
                     offload_f.flush()
                     os.fsync(offload_f.fileno())
                     offload_f.close()
+                    offload_f = None
 
                     # 读取 TD 传来的 common_metadata（放在数据页）
                     common_meta = json.loads(mm[PAGESIZE : PAGESIZE + dlen])
@@ -274,7 +285,8 @@ def run_host(kv_dir: str, verbose: bool = False) -> None:
         if fetch_fh:
             fetch_fh.close()
         try:
-            offload_f.close()
+            if offload_f is not None:
+                offload_f.close()
         except Exception:
             pass
         mm.close()
