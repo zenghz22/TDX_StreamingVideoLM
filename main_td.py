@@ -28,24 +28,12 @@ if __name__ == "__main__":
     parser.add_argument("--encode_memory", type=int, default=64)
     parser.add_argument("--encode_window", type=int, default=0)
 
-    # 差分压缩参数（方向 B）
-    parser.add_argument("--delta_max_p", type=int, default=0,
-                        help="Max consecutive P-frames per layer (0=disable delta).")
-    parser.add_argument("--delta_threshold", type=float, default=1e-3,
-                        help="V delta sparse quantization threshold.")
-    parser.add_argument("--delta_ratio_threshold", type=float, default=0.75,
-                        help="Max V delta nnz ratio to keep P-frame, else fallback to I.")
+
 
     parser.add_argument("--decode_select", type=int, default=0,
                         help="Number of chunks to select (0=all, use per-layer if >0).")
 
-    # 剪枝参数
-    parser.add_argument("--prune", action="store_true",
-                        help="Enable video token pruning.")
-    parser.add_argument("--prune_temporal", type=float, default=0.0,
-                        help="Temporal frame keep ratio (0~1).")
-    parser.add_argument("--prune_spatial", type=float, default=0.0,
-                        help="Spatial downscale ratio (0~1).")
+
 
     # 加密参数
     parser.add_argument("--encrypt", action="store_true",
@@ -61,19 +49,7 @@ if __name__ == "__main__":
     question      = "Who is in the video, and what are they doing?"
     encode_prefix = "You are a helpful assistant. Please understand the video content and prepare to answer single-choice questions."
 
-    # Prune context
-    prune_ctx = None
-    if args.prune and (args.prune_temporal > 0 or args.prune_spatial > 0):
-        from video_prune import PruneContext
-        prune_ctx = PruneContext(
-            enabled=True,
-            temporal_enabled=(args.prune_temporal > 0),
-            temporal_keep_ratio=args.prune_temporal if args.prune_temporal > 0 else 0.6,
-            spatial_enabled=(args.prune_spatial > 0),
-            spatial_ratio=args.prune_spatial if args.prune_spatial > 0 else None,
-            log_stats=True,
-        )
-        logger.info(f"[prune] temporal={args.prune_temporal}, spatial={args.prune_spatial}")
+
 
     # Crypto context
     crypto_ctx = None
@@ -100,13 +76,9 @@ if __name__ == "__main__":
                 encode_prefix=encode_prefix,
                 stage_mark=monitor["mark"],
                 kv_cache_dir=kv_cache_path,
-                prune_ctx=prune_ctx,
                 crypto_ctx=crypto_ctx,
                 max_in_memory=args.encode_memory,
                 window_size=args.encode_window if args.encode_window > 0 else None,
-                max_consecutive_p=args.delta_max_p,
-                delta_threshold=args.delta_threshold,
-                delta_ratio_threshold=args.delta_ratio_threshold,
             )
             monitor["mark"]("kvcache_encode_done")
 

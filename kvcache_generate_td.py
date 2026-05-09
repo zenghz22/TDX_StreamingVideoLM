@@ -213,33 +213,11 @@ def encode_video(
     encode_prefix=None,
     stage_mark=None,
     kv_cache_dir=None,
-    prune_ctx=None,               # 可选：video_token_prune_td.PruneContext
     crypto_ctx=None,              # 可选：kvcache_crypto_td.CryptoContext
     max_in_memory: int = 64,
     window_size: Optional[int] = None,
-    max_consecutive_p: int = 0,         # 每层最大连续 P 帧数（0=禁用差分）
-    delta_threshold: float = 1e-3,      # V 差分量化阈值
-    delta_ratio_threshold: float = 0.75 # 自适应回退 I 帧的稀疏率上限
 ):
-    """
-    将视频分块编码成 KV cache。
-
-    Parameters
-    ----------
-    prune_ctx : PruneContext | None
-        视觉 token 剪枝上下文（video_token_prune_td.PruneContext）。
-        None 时不剪枝。支持两级：帧级时序去冗余 + ViT 输出后空间剪枝。
-    crypto_ctx : CryptoContext | None
-        KV cache 加密上下文（kvcache_crypto_td.CryptoContext）。
-        None 或 enabled=False 时不加密。每个 chunk shard 保存后立即加密，
-        删除明文，decode 侧透明解密。
-    max_consecutive_p : int
-        每层允许的最大连续 PV 帧数，到达后自动插入 I 帧（0 禁用差分压缩）。
-    delta_threshold : float
-        PV 帧 V 差分量化阈值，绝对值小于此值置零。
-    delta_ratio_threshold : float
-        V 差分非零比例阈值，若超过此值则放弃使用 PV 帧，直接存 I 帧。
-    """
+    """将视频分块编码成 KV cache（全部存 I 帧，无差分压缩）。"""
     num_frames = video.shape[0]
     num_chunks = (num_frames + chunk_size - 1) // chunk_size
     chunk_records = []
@@ -292,31 +270,13 @@ def encode_video(
         )
     full_merged_seq_len = int(prefix_seq_len)
 
-    # ---- 剪枝说明 ────────────────────────────────────────────────────
-    # Level 0 temporal: 在 processor 之前减少帧数（有效）
-    # Level 1 spatial:  在 processor 之前降低分辨率（有效）
-    # ⚠️  mid-forward hook spatial 已移除（不兼容 LLaVA-OV attention_mask 预构建）
-    # ────────────────────────────────────────────────────────────────
-
-    # 各层连续 P 帧计数，将在第一次获得 delta_kv 后初始化
-    layer_p_count = None
+    # 无差分压缩，全部存 I 帧
 
     try:
         for i in range(num_chunks):
             chunk = video[i * chunk_size : min((i + 1) * chunk_size, num_frames)]
             if stage_mark is not None:
                 stage_mark(f"chunk_{i}_start")
-
-            frames_before_prune = len(chunk)
-
-            # ---- 剪枝 ----
-            if prune_ctx is not None:
-                from video_prune import temporal_filter_chunk, spatial_downscale_chunk
-                chunk = temporal_filter_chunk(chunk, prune_ctx, chunk_idx=i)
-                if len(chunk) == 0:
-                    print(f"[prune] chunk {i}: all frames filtered, skipping.")
-                    continue
-                chunk = spatial_downscale_chunk(chunk, prune_ctx, chunk_idx=i)
 
             pixel_values = processor.video_processor(chunk, return_tensors="pt").pixel_values_videos.to("cpu")
             print(f"[chunk {i}] pixel_values_videos shape: {tuple(pixel_values.shape)}")
@@ -464,82 +424,22 @@ def encode_video(
                         "model_name_or_path": getattr(model.config, "_name_or_path", None),
                         "window_size": window_size,
                         "storage_format": "kvpack_mmap_v1",
-                        "max_consecutive_p": int(max_consecutive_p),
-                        "delta_threshold": float(delta_threshold),
-                        "delta_ratio_threshold": float(delta_ratio_threshold),
                     }
 
-                # 初始化各层 P 计数
-                if layer_p_count is None:
-                    layer_p_count = [0] * len(delta_kv)
-
-                total_payload_bytes = 0
-                total_orig_bytes = 0
-                p_layer_count_this_frame = 0
-                i_layers = []                         # <-- 新增
-
                 for layer_idx, (layer_k, layer_v) in enumerate(delta_kv):
-                    use_p = False
-                    ref_v = None
-                    ref_frame = None
-
-                    if max_consecutive_p > 0 and i > 0 and layer_p_count[layer_idx] < max_consecutive_p:
-                        prev_kv = frame_cache.get(i - 1)
-                        if prev_kv is not None:
-                            ref_v = prev_kv[layer_idx][1]
-                            delta_v = (layer_v.float() - ref_v.float()).numpy()
-                            nnz_v = int(np.sum(np.abs(delta_v.ravel()) > delta_threshold))
-                            ratio_v = nnz_v / delta_v.size if delta_v.size > 0 else 1.0
-                            if ratio_v <= delta_ratio_threshold:
-                                use_p = True
-                                ref_frame = i - 1
-
-                    if use_p:
-                        rec = pack_writer.append_p_block(      
-                            frame_index=i,
-                            layer_index=layer_idx,
-                            seq_start=int(past_kv_seq_len),
-                            seq_end=int(full_kv_seq_len),
-                            key_tensor=layer_k,
-                            value_tensor=layer_v,
-                            ref_value_tensor=ref_v,
-                            ref_frame_index=ref_frame,
-                            delta_threshold=delta_threshold,
-                            encrypt_fn=encrypt_payload_fn,
-                        )
-                        layer_p_count[layer_idx] += 1
-                        p_layer_count_this_frame += 1
-                    else:
-                        rec = pack_writer.append_block(        
-                            frame_index=i,
-                            layer_index=layer_idx,
-                            seq_start=int(past_kv_seq_len),
-                            seq_end=int(full_kv_seq_len),
-                            key_tensor=layer_k,
-                            value_tensor=layer_v,
-                            encrypt_fn=encrypt_payload_fn,
-                        )
-                        layer_p_count[layer_idx] = 0
-                        i_layers.append(layer_idx)
-
-                    total_payload_bytes += int(rec["payload_len"])
-                    total_orig_bytes += layer_k.numel() * layer_k.element_size() * 2
-
+                    rec = pack_writer.append_block(
+                        frame_index=i,
+                        layer_index=layer_idx,
+                        seq_start=int(past_kv_seq_len),
+                        seq_end=int(full_kv_seq_len),
+                        key_tensor=layer_k,
+                        value_tensor=layer_v,
+                        encrypt_fn=encrypt_payload_fn,
+                    )
                     rec["chunk_index"] = int(i)
                     rec["block_index"] = len(chunk_records)
                     rec["delta_seq_len"] = int(delta_seq_len)
                     chunk_records.append(rec)
-
-                ratio = total_payload_bytes / total_orig_bytes if total_orig_bytes > 0 else 1.0
-                total_layers = len(delta_kv)
-                print(
-                    f"[delta:B] frame={i}  "
-                    f"P-layers={p_layer_count_this_frame}/{total_layers}  "
-                    f"payload={total_payload_bytes//1024}KB / orig={total_orig_bytes//1024}KB  "
-                    f"ratio={ratio:.3f}"
-                )
-                if i_layers:                            # <-- 新增
-                    print(f"  [delta:B] frame={i} I-layers ({len(i_layers)}): {i_layers}")
 
                 retrieval_chunk_indices.append(i)
                 retrieval_layer_key_vecs.append(chunk_layer_key_vec.cpu().contiguous())
@@ -561,8 +461,7 @@ def encode_video(
             gc.collect()
 
     finally:
-        if prune_ctx is not None and prune_ctx.log_stats:
-            print(prune_ctx.summary())
+        pass
 
     if kv_cache_dir is not None:
         common_metadata["full_merged_seq_len"] = int(full_merged_seq_len)

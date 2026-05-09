@@ -33,35 +33,12 @@ from typing import List
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
-from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
 from kvpack_mmap_td import KVPackReader, has_kvpack
 
 
 # ---------------------------------------------------------------------------
 # 从 manifest 加载 chunk 元数据
 # ---------------------------------------------------------------------------
-
-def _load_manifest_chunks(kv_cache_dir: str):
-    """
-    从 manifest.json 读取 chunk 记录。
-
-    Returns
-    -------
-    chunks : List[dict] 按 chunk_index 升序
-    """
-    manifest_path = os.path.join(kv_cache_dir, "manifest.json")
-    if not os.path.exists(manifest_path):
-        raise FileNotFoundError(f"manifest.json not found: {kv_cache_dir}")
-
-    with open(manifest_path, "r", encoding="utf-8") as f:
-        manifest = json.load(f)
-
-    chunks = sorted(manifest.get("chunks", []), key=lambda c: int(c.get("chunk_index", c.get("frame_index", -1))))
-    if not chunks:
-        raise ValueError("No chunk records in manifest.")
-
-    return chunks
-
 
 def _load_chunk_layer_key_vecs(kv_cache_dir: str, crypto_ctx=None):
     """
@@ -164,39 +141,6 @@ def _group_query_to_kv_heads(query_states: torch.Tensor, num_kv_heads: int) -> t
         ).mean(dim=2)
 
     return grouped.mean(dim=0).mean(dim=1).float()  # [num_kv_heads, head_dim]
-
-
-def _load_tail_kv_as_past(kv_cache_dir: str, map_location="cpu"):
-    """
-    按 manifest 中 window_size 加载视频尾部若干 chunk 作为 retrieval 的 past context。
-    若无 window_size，则退化为只加载最后一个 chunk（兼容旧数据）。
-    """
-    from kvcache_retrieve_td import _load_single_safetensors_kv, _concat_kv_segments
-
-    manifest_path = os.path.join(kv_cache_dir, "manifest.json")
-    with open(manifest_path, "r", encoding="utf-8") as f:
-        manifest = json.load(f)
-
-    chunks = sorted(manifest.get("chunks", []), key=lambda c: int(c["chunk_index"]))
-    if not chunks:
-        raise ValueError(f"No chunks found in manifest: {manifest_path}")
-
-    common_metadata = manifest.get("common_metadata", {}) or {}
-    window_size = common_metadata.get("window_size")
-    if window_size is None:
-        selected = [chunks[-1]]
-    else:
-        selected = chunks[-int(window_size):]
-
-    kv_segments = []
-    for c in selected:
-        shard_path = os.path.join(kv_cache_dir, c["file"])
-        shard_kv, _ = _load_single_safetensors_kv(shard_path, map_location=map_location)
-        kv_segments.append(shard_kv)
-
-    past_kv = _concat_kv_segments(kv_segments)
-    full_merged_seq_len = common_metadata.get("full_merged_seq_len")
-    return past_kv, full_merged_seq_len
 
 
 def _compute_query_vec(question: str, processor, model) -> torch.Tensor:

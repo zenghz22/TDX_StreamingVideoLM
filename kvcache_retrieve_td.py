@@ -170,8 +170,22 @@ def _assemble_per_layer_kv(
     if not has_kvpack(kv_cache_dir):
         raise FileNotFoundError(f"kvpack_index.json not found in {kv_cache_dir}")
 
-    # 先打开 reader 取 common_metadata，确保 num_layers 与 encrypt 侧对齐
-    reader = KVPackReader(kv_cache_dir)
+    # ── 自动检测 bridge 模式 ──────────────────────────────────────────────
+    # bridge 可用时，block I/O 由宿主进程（kvpack_bridge_host.py）负责：
+    #   TD 侧通过共享内存发请求，收到密文后在 TD 侧解密。
+    # bridge 不可用时，直接 mmap kvpack.bin（单进程模式，原有行为）。
+    try:
+        from kvpack_bridge_td import KVPackBridgeClient, is_bridge_available
+        _use_bridge = is_bridge_available()
+    except ImportError:
+        _use_bridge = False
+
+    if _use_bridge:
+        reader = KVPackBridgeClient(kv_cache_dir, crypto_ctx=crypto_ctx)
+        print(f"[retrieve] Using bridge mode (host process handles disk I/O).")
+    else:
+        reader = KVPackReader(kv_cache_dir)
+        print(f"[retrieve] Using direct mmap mode (no bridge host detected).")
     # ── Bug fix：num_layers 必须与 encrypt_fn 里的值完全相同，
     # 否则 layer_frame_block_id = frame * num_layers + layer 产生不同值 → HKDF 派生不同密钥 → 解密失败
     # 正确来源：kvpack_index.json 的 common_metadata["num_layers"]，与 encode 阶段写入的值一致
@@ -184,7 +198,7 @@ def _assemble_per_layer_kv(
             block_id = layer_frame_block_id(
                 frame_index=int(header["frame_index"]),
                 layer_index=int(header["layer_index"]),
-                num_layers=num_layers_for_key,   # 从 common_metadata 读取，与 encrypt 一致
+                num_layers=num_layers_for_key,
             )
             aad = {
                 "frame_index": int(header["frame_index"]),
@@ -194,33 +208,124 @@ def _assemble_per_layer_kv(
                 "dtype": str(header["dtype"]),
             }
             return decrypt_blob_to_bytes(
-                blob,
-                crypto_ctx.master_key,
+                blob, crypto_ctx.master_key,
                 expected_chunk_index=block_id,
                 expected_aad=aad,
             )
         decrypt_payload_fn = _decrypt_payload
+
+    # ── 方向 F：收集全部待解密任务，统一送入 batch_decrypt_payloads ──────────
+    # 串行模式（parallel_workers=1）：与原有行为完全一致
+    # 并行模式（parallel_workers>1）：所有 (layer, frame) 对同时解密
     try:
         n_layers = len(per_layer_chunk_indices)
-        per_layer_kv = []
-        seq_lens = []
-        for L_idx in range(n_layers):
-            selected = per_layer_chunk_indices[L_idx]
-            if not selected:
-                raise ValueError(f"layer {L_idx} has empty chunk selection")
-            k_list = []
-            v_list = []
-            for frame_idx in selected:
-                k, v, _ = reader.read_layer_frame(
-                    L_idx, int(frame_idx), map_location=map_location, decrypt_fn=decrypt_payload_fn
+
+        if crypto_ctx is not None and getattr(crypto_ctx, "enabled", False) and \
+                getattr(crypto_ctx, "parallel_workers", 1) > 1:
+            # ── 并行路径：先收集所有 raw bytes，再批量解密，最后重组 ────────
+            import time
+            t_read = time.time()
+
+            # 1. 收集原始 mmap 读取任务（mmap 读本身不解密，无需并行）
+            from kvpack_mmap_td import BLOCK_HEAD as _BLOCK_HEAD
+            all_tasks = []   # (L_idx, frame_idx, raw_blob, header)
+            for L_idx in range(n_layers):
+                for frame_idx in per_layer_chunk_indices[L_idx]:
+                    rec = reader.by_layer_frame[(L_idx, int(frame_idx))]
+                    header = reader._read_header(rec)
+                    off = int(rec["offset"])
+                    hlen = int(rec["header_len"])
+                    pstart = off + _BLOCK_HEAD.size + hlen
+                    raw_blob = bytes(reader._mmap[pstart : pstart + int(rec["payload_len"])])
+                    all_tasks.append((L_idx, int(frame_idx), raw_blob, header))
+
+            t_read_done = time.time()
+
+            # 2. 批量解密（此处触发 timing log）
+            def _do_decrypt(task):
+                L_idx, frame_idx, raw_blob, header = task
+                plaintext = decrypt_payload_fn(raw_blob, header)
+                return (L_idx, frame_idx, plaintext, header)
+
+            decrypted = crypto_ctx.batch_decrypt_payloads(
+                all_tasks, decrypt_fn=_do_decrypt
+            )
+
+            # 3. 将解密结果重组为 (L_idx, frame_idx) → (K, V) 的映射
+            import numpy as np
+            from kvpack_mmap_td import _DTYPE_TO_NP
+            kv_by_layer_frame = {}
+            for L_idx, frame_idx, plaintext, header in decrypted:
+                dtype_key = header["dtype"]
+                np_dtype = _DTYPE_TO_NP[dtype_key]
+                k_nbytes = int(header["k_nbytes"])
+                k_count = k_nbytes // np.dtype(np_dtype).itemsize
+                v_count = (len(plaintext) - k_nbytes) // np.dtype(np_dtype).itemsize
+                k_np = np.frombuffer(plaintext, dtype=np_dtype, count=k_count, offset=0)
+                v_np = np.frombuffer(plaintext, dtype=np_dtype, count=v_count, offset=k_nbytes)
+                k = torch.from_numpy(k_np.copy()).reshape(header["k_shape"])
+                v = torch.from_numpy(v_np.copy()).reshape(header["v_shape"])
+                if dtype_key == "torch.bfloat16":
+                    k = k.view(torch.bfloat16)
+                    v = v.view(torch.bfloat16)
+                kv_by_layer_frame[(L_idx, frame_idx)] = (
+                    k.to(map_location), v.to(map_location)
                 )
-                k_list.append(k)
-                v_list.append(v)
-            K_cat = torch.cat(k_list, dim=-2)
-            V_cat = torch.cat(v_list, dim=-2)
-            per_layer_kv.append((K_cat, V_cat))
-            seq_lens.append(K_cat.shape[-2])
-        union_ids = sorted(set((L, ci) for L, ids in enumerate(per_layer_chunk_indices) for ci in ids))
+
+            # 4. 按层顺序组装 per_layer_kv
+            per_layer_kv = []
+            seq_lens = []
+            for L_idx in range(n_layers):
+                selected = per_layer_chunk_indices[L_idx]
+                k_list = [kv_by_layer_frame[(L_idx, fi)][0] for fi in selected]
+                v_list = [kv_by_layer_frame[(L_idx, fi)][1] for fi in selected]
+                K_cat = torch.cat(k_list, dim=-2)
+                V_cat = torch.cat(v_list, dim=-2)
+                per_layer_kv.append((K_cat, V_cat))
+                seq_lens.append(K_cat.shape[-2])
+
+            if getattr(crypto_ctx, "log_timing", False):
+                print(
+                    f"[crypto:F] mmap read={t_read_done - t_read:.3f}s  "
+                    f"total tasks={len(all_tasks)}"
+                )
+
+        else:
+            # ── 串行路径（默认）：逐层逐帧，与原有行为完全一致 ───────────────
+            import time
+            t0 = time.time()
+            per_layer_kv = []
+            seq_lens = []
+            for L_idx in range(n_layers):
+                selected = per_layer_chunk_indices[L_idx]
+                if not selected:
+                    raise ValueError(f"layer {L_idx} has empty chunk selection")
+                k_list, v_list = [], []
+                for frame_idx in selected:
+                    k, v, _ = reader.read_layer_frame(
+                        L_idx, int(frame_idx),
+                        map_location=map_location,
+                        decrypt_fn=decrypt_payload_fn,
+                    )
+                    k_list.append(k)
+                    v_list.append(v)
+                K_cat = torch.cat(k_list, dim=-2)
+                V_cat = torch.cat(v_list, dim=-2)
+                per_layer_kv.append((K_cat, V_cat))
+                seq_lens.append(K_cat.shape[-2])
+
+            elapsed = time.time() - t0
+            n_blocks = sum(len(ids) for ids in per_layer_chunk_indices)
+            if crypto_ctx is not None and getattr(crypto_ctx, "log_timing", False):
+                avg_ms = elapsed / n_blocks * 1000 if n_blocks else 0
+                print(
+                    f"[crypto:F] DECRYPT serial  "
+                    f"n={n_blocks}  total={elapsed:.3f}s  avg={avg_ms:.2f}ms/block"
+                )
+
+        union_ids = sorted(set(
+            (L, ci) for L, ids in enumerate(per_layer_chunk_indices) for ci in ids
+        ))
     finally:
         reader.close()
 
@@ -283,7 +388,17 @@ def load_kv_cache(kv_cache_path, map_location="cpu", chunk_index=None, chunk_ind
                 expected_aad=aad,
             )
         decrypt_payload_fn = _decrypt_payload
-    reader = KVPackReader(kv_cache_path)
+    # 同样支持 bridge 模式（load_kv_cache 用于全量加载，不走 per-layer 路径）
+    try:
+        from kvpack_bridge_td import KVPackBridgeClient, is_bridge_available
+        _use_bridge_lkv = is_bridge_available()
+    except ImportError:
+        _use_bridge_lkv = False
+
+    if _use_bridge_lkv:
+        reader = KVPackBridgeClient(kv_cache_path, crypto_ctx=crypto_ctx)
+    else:
+        reader = KVPackReader(kv_cache_path)
     try:
         frame_ids = sorted(reader.frames.keys())
         if chunk_indices is not None:
