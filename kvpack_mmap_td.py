@@ -43,6 +43,14 @@ _DTYPE_TO_NP = {
     "torch.int64": np.int64,
 }
 
+__all__ = [
+    "KVPackWriter",
+    "KVPackReader",
+    "has_kvpack",
+    "BLOCK_MAGIC",
+    "BLOCK_HEAD",
+]
+
 
 # ---------------------------------------------------------------------------
 # Delta 压缩：I 帧（关键帧）存完整 KV，P 帧存稀疏差分

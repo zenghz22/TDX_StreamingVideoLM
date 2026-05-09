@@ -61,6 +61,42 @@ FMT_DATALEN = struct.Struct("<Q")
 FMT_ERR     = struct.Struct("<I")
 
 
+def _try_prepare_fetch_from_disk(kv_dir: str):
+    """
+    尝试从现有 kvpack.bin + kvpack_index.json 恢复 fetch 服务，
+    使 decode-only 场景无需依赖本次进程内 encode/finalize。
+    """
+    bin_path = os.path.join(kv_dir, "kvpack.bin")
+    index_path = os.path.join(kv_dir, "kvpack_index.json")
+    if not (os.path.exists(bin_path) and os.path.exists(index_path)):
+        return None, None, {}
+
+    with open(index_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    records = payload.get("blocks", [])
+    block_index = {}
+    for rec in records:
+        block_index[(int(rec["layer_index"]), int(rec["frame_index"]))] = rec
+
+    bin_size = os.path.getsize(bin_path)
+    if bin_size <= 0:
+        # 允许 decode-only host 在“目录已存在但尚无有效 KV block”场景下正常启动。
+        # 后续若收到 FINALIZE，会重新打开 mmap 并完成 fetch 状态构建。
+        print(
+            f"[host] preload skipped: {bin_path} is empty (size=0). "
+            "Waiting for FINALIZE to build fetch state."
+        )
+        return None, None, {}
+
+    fetch_fh = open(bin_path, "rb")
+    fetch_mm = mmap.mmap(fetch_fh.fileno(), 0, access=mmap.ACCESS_READ)
+    print(
+        f"[host] preload fetch state from disk: blocks={len(records)} "
+        f"size={bin_size}B path={bin_path}"
+    )
+    return fetch_fh, fetch_mm, block_index
+
+
 def _create_shm(path: str, size: int) -> None:
     with open(path, "w+b") as f:
         f.write(b"\x00" * size)
@@ -81,19 +117,22 @@ def run_host(kv_dir: str, verbose: bool = False) -> None:
     # ── offload 侧：顺序追加写文件句柄 ──────────────────────────────────
     bin_path   = os.path.join(kv_dir, "kvpack.bin")
     index_path = os.path.join(kv_dir, "kvpack_index.json")
-    offload_f  = open(bin_path, "wb")   # 追加写
+    # 延迟打开：避免 host 启动后 TD 侧清理目录导致 fd 指向已删除 inode。
+    offload_f  = None
     records    = []   # 接收 TD 推来的 index 记录
 
-    # ── fetch 侧：decode 阶段 mmap 读句柄（encode 结束后打开）────────────
-    fetch_fh   = None
-    fetch_mm   = None
-    block_index: dict = {}   # (layer, frame) → rec
+    # ── fetch 侧：decode 阶段 mmap 读句柄（优先尝试从磁盘恢复）────────────
+    fetch_fh, fetch_mm, block_index = _try_prepare_fetch_from_disk(kv_dir)
 
     req_offload = 0
     req_fetch   = 0
     t_start     = time.time()
 
     print(f"[host] kv_dir={kv_dir}  ready, waiting for requests...")
+    if fetch_mm is None:
+        print("[host] fetch state not ready yet; waiting for FINALIZE or existing files.")
+    else:
+        print(f"[host] fetch state ready from disk, indexed blocks={len(block_index)}")
 
     try:
         while True:
@@ -101,6 +140,14 @@ def run_host(kv_dir: str, verbose: bool = False) -> None:
 
             if status == STATUS_IDLE:
                 continue   # busy-wait
+            if status == STATUS_RESPONSE_READY:
+                # 仅 TD 侧应消费 RESPONSE_READY 并回写 IDLE。
+                # 若 host 读到该状态，说明存在竞态/残留状态，host 不应把它当新请求处理。
+                mm[OFF_STATUS] = STATUS_IDLE
+                mm.flush()
+                if verbose:
+                    print("[host] cleared stale RESPONSE_READY -> IDLE")
+                continue
 
             mm[OFF_STATUS] = STATUS_HOST_BUSY
             mm.flush()
@@ -112,6 +159,10 @@ def run_host(kv_dir: str, verbose: bool = False) -> None:
             # ── OFFLOAD：encode 阶段 TD 推一个 block ─────────────────────
             if status == STATUS_OFFLOAD_READY:
                 try:
+                    if offload_f is None:
+                        os.makedirs(kv_dir, exist_ok=True)
+                        offload_f = open(bin_path, "wb")
+                        print(f"[host] OFFLOAD sink opened: {bin_path}")
                     raw = bytes(mm[PAGESIZE : PAGESIZE + dlen])
                     file_offset = offload_f.tell()
                     offload_f.write(raw)
@@ -146,9 +197,15 @@ def run_host(kv_dir: str, verbose: bool = False) -> None:
             # ── FINALIZE：encode 结束，写 kvpack_index.json ───────────────
             elif status == STATUS_FINALIZE_READY:
                 try:
+                    if offload_f is None:
+                        # 允许“仅 FINALIZE”恢复场景：没有任何 OFFLOAD 也可产出空索引。
+                        os.makedirs(kv_dir, exist_ok=True)
+                        offload_f = open(bin_path, "wb")
+                        print(f"[host] FINALIZE with empty OFFLOAD stream, created {bin_path}")
                     offload_f.flush()
                     os.fsync(offload_f.fileno())
                     offload_f.close()
+                    offload_f = None
 
                     # 读取 TD 传来的 common_metadata（放在数据页）
                     common_meta = json.loads(mm[PAGESIZE : PAGESIZE + dlen])
@@ -205,6 +262,8 @@ def run_host(kv_dir: str, verbose: bool = False) -> None:
                     FMT_ERR.pack_into(mm, OFF_ERR_FLAG, 0)
 
                     req_fetch += 1
+                    if not verbose:
+                        print(f"[host] fetch ok (L={layer},F={frame}) bytes={btotal}")
                     if verbose:
                         print(f"[host] fetch (L={layer},F={frame}) {btotal//1024}KB")
                 except Exception as e:
@@ -234,7 +293,8 @@ def run_host(kv_dir: str, verbose: bool = False) -> None:
         if fetch_fh:
             fetch_fh.close()
         try:
-            offload_f.close()
+            if offload_f is not None:
+                offload_f.close()
         except Exception:
             pass
         mm.close()
