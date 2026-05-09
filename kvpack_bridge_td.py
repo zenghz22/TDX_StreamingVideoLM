@@ -64,7 +64,8 @@ def is_bridge_available() -> bool:
         mm = mmap.mmap(fd, PAGESIZE, mmap.MAP_SHARED, mmap.PROT_READ)
         status = mm[OFF_STATUS]
         mm.close(); os.close(fd)
-        return status == STATUS_IDLE
+        # host may transiently stay in busy/response states; treat any non-shutdown as available
+        return status != STATUS_SHUTDOWN
     except Exception:
         return False
 
@@ -80,14 +81,14 @@ def _wait_idle(mm: mmap.mmap, timeout: float) -> None:
     t0 = time.time()
     while mm[OFF_STATUS] not in (STATUS_IDLE, STATUS_RESPONSE_READY):
         if time.time() - t0 > timeout:
-            raise TimeoutError("Bridge host not responding")
+            raise TimeoutError(f"Bridge host not responding, status={int(mm[OFF_STATUS])}")
 
 
 def _wait_response(mm: mmap.mmap, timeout: float) -> None:
     t0 = time.time()
     while mm[OFF_STATUS] != STATUS_RESPONSE_READY:
         if time.time() - t0 > timeout:
-            raise TimeoutError("Bridge host response timed out")
+            raise TimeoutError(f"Bridge host response timed out, status={int(mm[OFF_STATUS])}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -121,7 +122,7 @@ class KVPackBridgeWriter:
         self._dummy_writer = _W.__new__(_W)
         self._dummy_writer._f = io.BytesIO()
         self._dummy_writer.records = []
-        print(f"[bridge/td] KVPackBridgeWriter ready, offloading to host.")
+        print(f"[bridge/td] KVPackBridgeWriter ready, offloading to host. kv_dir={kv_cache_dir}")
 
     def _offload_block(self, block_bytes: bytes, rec: dict) -> None:
         """
@@ -139,6 +140,7 @@ class KVPackBridgeWriter:
             )
 
         _wait_idle(mm, REQUEST_TIMEOUT)
+        print(f"[bridge/td] OFFLOAD send L={rec.get('layer_index')} F={rec.get('frame_index')} bytes={len(payload)}")
         mm[PAGESIZE : PAGESIZE + len(payload)] = payload
         FMT_FRAME.pack_into(mm, OFF_FRAME, rec.get("frame_index", 0))
         FMT_LAYER.pack_into(mm, OFF_LAYER, rec.get("layer_index", 0))
@@ -159,7 +161,7 @@ class KVPackBridgeWriter:
         if err:
             raise RuntimeError(
                 f"Host OFFLOAD error for (L={rec.get('layer_index')}, "
-                f"F={rec.get('frame_index')})"
+                f"F={rec.get('frame_index')}), status={int(mm[OFF_STATUS])}"
             )
 
     def append_block(self, *, frame_index, layer_index, seq_start, seq_end,
@@ -183,30 +185,6 @@ class KVPackBridgeWriter:
         self.records.append(rec)
         return rec
 
-    def append_p_block(self, *, frame_index, layer_index, seq_start, seq_end,
-                       key_tensor, value_tensor, ref_value_tensor,
-                       ref_frame_index, delta_threshold=1e-3, encrypt_fn=None) -> dict:
-        """与 KVPackWriter.append_p_block 接口完全相同。"""
-        dw = self._dummy_writer
-        dw._f.seek(0)
-        dw._f.truncate(0)
-        rec = dw.append_p_block(
-            frame_index=frame_index, layer_index=layer_index,
-            seq_start=seq_start, seq_end=seq_end,
-            key_tensor=key_tensor, value_tensor=value_tensor,
-            ref_value_tensor=ref_value_tensor,
-            ref_frame_index=ref_frame_index,
-            delta_threshold=delta_threshold,
-            encrypt_fn=encrypt_fn,
-        )
-        dw._f.seek(0)
-        block_bytes = dw._f.read()
-        dw.records.clear()
-
-        self._offload_block(block_bytes, rec)
-        self.records.append(rec)
-        return rec
-
     def write_index(self, common_metadata: dict) -> None:
         """encode 结束：通知宿主写 kvpack_index.json。"""
         mm = self._mm
@@ -215,6 +193,7 @@ class KVPackBridgeWriter:
             raise ValueError("common_metadata too large for bridge")
 
         _wait_idle(mm, REQUEST_TIMEOUT)
+        print(f"[bridge/td] FINALIZE send metadata bytes={len(meta_bytes)}")
         mm[PAGESIZE : PAGESIZE + len(meta_bytes)] = meta_bytes
         FMT_DATALEN.pack_into(mm, OFF_DATA_LEN, len(meta_bytes))
         mm.flush()
@@ -266,7 +245,8 @@ class KVPackBridgeClient:
 
         print(f"[bridge/td] KVPackBridgeClient: "
               f"{len(self.by_layer_frame)} blocks, "
-              f"crypto={'on' if crypto_ctx and crypto_ctx.enabled else 'off'}")
+              f"crypto={'on' if crypto_ctx and crypto_ctx.enabled else 'off'}, "
+              f"num_layers={self._num_layers}, timeout={self._timeout}s")
 
     def read_layer_frame(self, layer_index: int, frame_index: int,
                          *, map_location: str = "cpu",
@@ -278,6 +258,7 @@ class KVPackBridgeClient:
 
         t0 = time.time()
         _wait_idle(mm, self._timeout)
+        print(f"[bridge/td] FETCH request L={layer_index} F={frame_index}")
 
         FMT_FRAME.pack_into(mm, OFF_FRAME, frame_index)
         FMT_LAYER.pack_into(mm, OFF_LAYER, layer_index)
@@ -304,7 +285,7 @@ class KVPackBridgeClient:
 
     def _parse_raw(self, raw: bytes, layer_index: int, frame_index: int,
                    map_location: str) -> Tuple[torch.Tensor, torch.Tensor, dict]:
-        from kvpack_mmap_td import BLOCK_HEAD, _DTYPE_TO_NP, _unpack_sparse_delta
+        from kvpack_mmap_td import BLOCK_HEAD, _DTYPE_TO_NP
         magic, hlen, plen = BLOCK_HEAD.unpack_from(raw, 0)
         if magic != b"KVPBLK01":
             raise ValueError(f"Bad magic: {magic!r}")
@@ -343,28 +324,8 @@ class KVPackBridgeClient:
             if dtype_key == "torch.bfloat16":
                 k, v = k.view(torch.bfloat16), v.view(torch.bfloat16)
 
-        elif block_type in ("PV", "P"):
-            k_nbytes  = int(header["k_nbytes"])
-            mask_v_b  = int(header["mask_v_bytes"])
-            k_count   = k_nbytes // np.dtype(np_dtype).itemsize
-            k_buf     = np.frombuffer(payload, dtype=np_dtype, count=k_count)
-            k = torch.from_numpy(k_buf.copy()).reshape(header["k_shape"])
-            if dtype_key == "torch.bfloat16":
-                k = k.view(torch.bfloat16)
-            _, v_ref, _ = self.read_layer_frame(
-                layer_index, int(header["ref_frame"]), map_location="cpu"
-            )
-            mask_v  = payload[k_nbytes : k_nbytes + mask_v_b]
-            nz_v    = payload[k_nbytes + mask_v_b :]
-            delta_v = _unpack_sparse_delta(mask_v, nz_v, tuple(header["v_shape"]),
-                                           np.float32, int(header["nnz_v"]))
-            v = (v_ref.float() + torch.from_numpy(delta_v.astype(np.float32))).to(
-                {"torch.float32": torch.float32,
-                 "torch.float16": torch.float16,
-                 "torch.bfloat16": torch.bfloat16}.get(dtype_key, torch.float32)
-            )
         else:
-            raise ValueError(f"Unknown block_type={block_type!r}")
+            raise ValueError(f"Unsupported block_type={block_type!r}; only 'I' is supported in mainline mode")
 
         return k.to(map_location), v.to(map_location), header
 
