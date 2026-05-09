@@ -78,9 +78,22 @@ def _try_prepare_fetch_from_disk(kv_dir: str):
     for rec in records:
         block_index[(int(rec["layer_index"]), int(rec["frame_index"]))] = rec
 
+    bin_size = os.path.getsize(bin_path)
+    if bin_size <= 0:
+        # 允许 decode-only host 在“目录已存在但尚无有效 KV block”场景下正常启动。
+        # 后续若收到 FINALIZE，会重新打开 mmap 并完成 fetch 状态构建。
+        print(
+            f"[host] preload skipped: {bin_path} is empty (size=0). "
+            "Waiting for FINALIZE to build fetch state."
+        )
+        return None, None, {}
+
     fetch_fh = open(bin_path, "rb")
     fetch_mm = mmap.mmap(fetch_fh.fileno(), 0, access=mmap.ACCESS_READ)
-    print(f"[host] preload fetch state from disk: blocks={len(records)} path={bin_path}")
+    print(
+        f"[host] preload fetch state from disk: blocks={len(records)} "
+        f"size={bin_size}B path={bin_path}"
+    )
     return fetch_fh, fetch_mm, block_index
 
 
