@@ -151,12 +151,7 @@ def _assemble_per_layer_kv(
     因此不同层携带不同 chunk 的内容完全合法，无需修改 attention 计算。
 
     唯一约束：所有层的 T（序列维度）必须相同，因为 attention_mask 是全局共享的。
-    - 不开 temporal prune：所有 chunk T_chunk 相同（16帧×196tokens=3136），
-      k 个 chunk → T = k × 3136，自动满足。
-    - 开 temporal prune：不同 chunk T_chunk 可能不同，此时做 zero-padding 并输出警告。
-      zero-padded 的 K/V 对 attention 影响极小（Q·0=0，softmax 结果接近 0），
-      但若精度敏感，建议 eval 时关闭 temporal prune。
-
+    - 
     参数
     ----
     per_layer_chunk_indices : List[List[int]]
@@ -182,10 +177,10 @@ def _assemble_per_layer_kv(
 
     if _use_bridge:
         reader = KVPackBridgeClient(kv_cache_dir, crypto_ctx=crypto_ctx)
-        print(f"[retrieve] Using bridge mode (host process handles disk I/O).")
+        print(f"[retrieve] Using bridge mode (host process handles disk I/O), kv_dir={kv_cache_dir}.")
     else:
         reader = KVPackReader(kv_cache_dir)
-        print(f"[retrieve] Using direct mmap mode (no bridge host detected).")
+        print(f"[retrieve] Using direct mmap mode (no bridge host detected), kv_dir={kv_cache_dir}.")
     # ── Bug fix：num_layers 必须与 encrypt_fn 里的值完全相同，
     # 否则 layer_frame_block_id = frame * num_layers + layer 产生不同值 → HKDF 派生不同密钥 → 解密失败
     # 正确来源：kvpack_index.json 的 common_metadata["num_layers"]，与 encode 阶段写入的值一致
@@ -229,6 +224,7 @@ def _assemble_per_layer_kv(
             # 1. 收集原始 mmap 读取任务（mmap 读本身不解密，无需并行）
             from kvpack_mmap_td import BLOCK_HEAD as _BLOCK_HEAD
             all_tasks = []   # (L_idx, frame_idx, raw_blob, header)
+            print(f"[retrieve] assemble_per_layer_kv serial load: layers={n_layers}")
             for L_idx in range(n_layers):
                 for frame_idx in per_layer_chunk_indices[L_idx]:
                     rec = reader.by_layer_frame[(L_idx, int(frame_idx))]
@@ -329,7 +325,7 @@ def _assemble_per_layer_kv(
     finally:
         reader.close()
 
-    # ── 3. 处理不等长（temporal prune 场景）─────────────────────────────────
+    # ── 3. 处理不等长（保守兼容）─────────────────────────────────
     unique_lens = set(seq_lens)
     if len(unique_lens) > 1:
         max_len = max(seq_lens)
@@ -338,7 +334,7 @@ def _assemble_per_layer_kv(
             f"[assemble_per_layer_kv] WARNING: layers have unequal seq_len "
             f"(min={min_len}, max={max_len}). "
             f"Zero-padding shorter layers to {max_len}. "
-            f"Consider disabling temporal pruning for eval to avoid this."
+            f"Please ensure chunk selection yields consistent sequence lengths for best reproducibility."
         )
         new_kv = []
         for (K, V), T in zip(per_layer_kv, seq_lens):

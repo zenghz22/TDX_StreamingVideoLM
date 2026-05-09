@@ -13,6 +13,7 @@ from safetensors.torch import save_file
 from transformers import LlavaOnevisionForConditionalGeneration as LlavaOV
 from transformers import LlavaOnevisionProcessor
 from kvpack_mmap_td import KVPackWriter, KVPackReader
+from kvpack_bridge_td import KVPackBridgeWriter, is_bridge_available
 
 # 统一前缀：编码和解码都基于同一语境，避免 KV 与后续文本提示错位。
 VIDEO_PLACEHOLDER = "<video>"
@@ -202,7 +203,7 @@ def _encode_and_save_prefix(encode_prefix, processor, model, kv_cache_dir, devic
 
 
 # ---------------------------------------------------------------------------
-# encode_video — 带自适应 PV 差分存储
+# encode_video — mainline I-frame KV storage
 # ---------------------------------------------------------------------------
 
 def encode_video(
@@ -229,7 +230,13 @@ def encode_video(
     pack_writer = None
     if kv_cache_dir is not None:
         os.makedirs(kv_cache_dir, exist_ok=True)
-        pack_writer = KVPackWriter(kv_cache_dir)
+        use_bridge_write = is_bridge_available()
+        if use_bridge_write:
+            print(f"[encode/bridge] bridge shm detected, using KVPackBridgeWriter for {kv_cache_dir}")
+            pack_writer = KVPackBridgeWriter(kv_cache_dir)
+        else:
+            print(f"[encode/bridge] bridge not available, using local KVPackWriter for {kv_cache_dir}")
+            pack_writer = KVPackWriter(kv_cache_dir)
 
     # 帧级缓存：frame_idx -> tuple[L](k,v)
     frame_cache = {}
@@ -386,7 +393,7 @@ def encode_video(
             full_kv_after = outputs.past_key_values
 
             # ------------------------------------------------------------
-            # 提取本 chunk 的 delta KV
+            # 提取本 chunk 的新增 KV
             if full_kv_after:
                 full_kv_seq_len = int(full_kv_after[0][0].shape[-2])
                 delta_kv = tuple(
@@ -413,7 +420,7 @@ def encode_video(
                 chunk_summary_vec = None
 
             # ------------------------------------------------------------
-            # 保存 delta 到磁盘 & 更新状态
+            # 保存 KV 到磁盘 & 更新状态
             if kv_cache_dir is not None and delta_kv is not None:
                 if not common_metadata:
                     common_metadata = {
@@ -426,6 +433,7 @@ def encode_video(
                         "storage_format": "kvpack_mmap_v1",
                     }
 
+                print(f"[encode/kv] chunk={i} delta_seq_len={delta_seq_len} layers={len(delta_kv)}")
                 for layer_idx, (layer_k, layer_v) in enumerate(delta_kv):
                     rec = pack_writer.append_block(
                         frame_index=i,
@@ -440,6 +448,12 @@ def encode_video(
                     rec["block_index"] = len(chunk_records)
                     rec["delta_seq_len"] = int(delta_seq_len)
                     chunk_records.append(rec)
+                    if layer_idx == 0:
+                        print(
+                            f"[encode/kv] wrote chunk={i} layer={layer_idx} "
+                            f"seq=[{rec['seq_start']},{rec['seq_end']}) "
+                            f"payload={rec.get('payload_len', -1)}B encrypted={rec.get('encrypted', False)}"
+                        )
 
                 retrieval_chunk_indices.append(i)
                 retrieval_layer_key_vecs.append(chunk_layer_key_vec.cpu().contiguous())

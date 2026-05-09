@@ -61,6 +61,42 @@ FMT_DATALEN = struct.Struct("<Q")
 FMT_ERR     = struct.Struct("<I")
 
 
+def _try_prepare_fetch_from_disk(kv_dir: str):
+    """
+    尝试从现有 kvpack.bin + kvpack_index.json 恢复 fetch 服务，
+    使 decode-only 场景无需依赖本次进程内 encode/finalize。
+    """
+    bin_path = os.path.join(kv_dir, "kvpack.bin")
+    index_path = os.path.join(kv_dir, "kvpack_index.json")
+    if not (os.path.exists(bin_path) and os.path.exists(index_path)):
+        return None, None, {}
+
+    with open(index_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    records = payload.get("blocks", [])
+    block_index = {}
+    for rec in records:
+        block_index[(int(rec["layer_index"]), int(rec["frame_index"]))] = rec
+
+    bin_size = os.path.getsize(bin_path)
+    if bin_size <= 0:
+        # 允许 decode-only host 在“目录已存在但尚无有效 KV block”场景下正常启动。
+        # 后续若收到 FINALIZE，会重新打开 mmap 并完成 fetch 状态构建。
+        print(
+            f"[host] preload skipped: {bin_path} is empty (size=0). "
+            "Waiting for FINALIZE to build fetch state."
+        )
+        return None, None, {}
+
+    fetch_fh = open(bin_path, "rb")
+    fetch_mm = mmap.mmap(fetch_fh.fileno(), 0, access=mmap.ACCESS_READ)
+    print(
+        f"[host] preload fetch state from disk: blocks={len(records)} "
+        f"size={bin_size}B path={bin_path}"
+    )
+    return fetch_fh, fetch_mm, block_index
+
+
 def _create_shm(path: str, size: int) -> None:
     with open(path, "w+b") as f:
         f.write(b"\x00" * size)
@@ -84,16 +120,18 @@ def run_host(kv_dir: str, verbose: bool = False) -> None:
     offload_f  = open(bin_path, "wb")   # 追加写
     records    = []   # 接收 TD 推来的 index 记录
 
-    # ── fetch 侧：decode 阶段 mmap 读句柄（encode 结束后打开）────────────
-    fetch_fh   = None
-    fetch_mm   = None
-    block_index: dict = {}   # (layer, frame) → rec
+    # ── fetch 侧：decode 阶段 mmap 读句柄（优先尝试从磁盘恢复）────────────
+    fetch_fh, fetch_mm, block_index = _try_prepare_fetch_from_disk(kv_dir)
 
     req_offload = 0
     req_fetch   = 0
     t_start     = time.time()
 
     print(f"[host] kv_dir={kv_dir}  ready, waiting for requests...")
+    if fetch_mm is None:
+        print("[host] fetch state not ready yet; waiting for FINALIZE or existing files.")
+    else:
+        print(f"[host] fetch state ready from disk, indexed blocks={len(block_index)}")
 
     try:
         while True:
@@ -205,6 +243,8 @@ def run_host(kv_dir: str, verbose: bool = False) -> None:
                     FMT_ERR.pack_into(mm, OFF_ERR_FLAG, 0)
 
                     req_fetch += 1
+                    if not verbose:
+                        print(f"[host] fetch ok (L={layer},F={frame}) bytes={btotal}")
                     if verbose:
                         print(f"[host] fetch (L={layer},F={frame}) {btotal//1024}KB")
                 except Exception as e:
