@@ -79,7 +79,7 @@ def _open_shm():
 
 def _wait_idle(mm: mmap.mmap, timeout: float) -> None:
     t0 = time.time()
-    while mm[OFF_STATUS] not in (STATUS_IDLE, STATUS_RESPONSE_READY):
+    while mm[OFF_STATUS] != STATUS_IDLE:
         if time.time() - t0 > timeout:
             raise TimeoutError(f"Bridge host not responding, status={int(mm[OFF_STATUS])}")
 

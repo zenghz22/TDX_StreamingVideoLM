@@ -43,6 +43,14 @@ _DTYPE_TO_NP = {
     "torch.int64": np.int64,
 }
 
+__all__ = [
+    "KVPackWriter",
+    "KVPackReader",
+    "has_kvpack",
+    "BLOCK_MAGIC",
+    "BLOCK_HEAD",
+]
+
 
 # ---------------------------------------------------------------------------
 # Mainline mode: only I-frame KV blocks are supported.
