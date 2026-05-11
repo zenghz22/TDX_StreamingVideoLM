@@ -65,6 +65,6 @@ run_decode(){
 #run_encode 1 512 64
 #run_decode 1 32 64
 # 加密解密流程验证
-#run_encode_encrypt 1 512 64
+run_encode_encrypt 1 512 64
 #run_decode 1 32 64
 run_decode_decrypt 1 32 64

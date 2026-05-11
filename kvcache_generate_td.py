@@ -19,6 +19,30 @@ from kvpack_bridge_td import KVPackBridgeWriter, is_bridge_available
 VIDEO_PLACEHOLDER = "<video>"
 
 
+class _EncodeIOStats:
+    """统计 encode 阶段 KV 落盘/桥接 I/O 的总开销。"""
+    def __init__(self):
+        self.blocks = 0
+        self.bytes_total = 0
+        self.seconds_total = 0.0
+
+    def record(self, payload_len: int, seconds: float):
+        self.blocks += 1
+        self.bytes_total += int(payload_len)
+        self.seconds_total += float(seconds)
+
+    def summary(self) -> str:
+        if self.blocks == 0:
+            return "[encode/io-stats] no KV blocks written."
+        bw = (self.bytes_total / (1024 * 1024)) / self.seconds_total if self.seconds_total > 0 else 0.0
+        avg_kb = (self.bytes_total / self.blocks) / 1024
+        avg_ms = (self.seconds_total / self.blocks) * 1000
+        return (
+            f"[encode/io-stats] blocks={self.blocks} total={self.bytes_total/1024/1024:.2f}MB "
+            f"time={self.seconds_total:.3f}s bw={bw:.2f}MB/s avg={avg_kb:.1f}KB/{avg_ms:.2f}ms"
+        )
+
+
 def _build_encode_text(encode_prefix):
     """确保文本中包含视频占位符，否则会出现 tokens/features 不匹配。"""
     text = (encode_prefix or "").strip()
@@ -226,6 +250,7 @@ def encode_video(
     retrieval_chunk_indices = []
     retrieval_layer_key_vecs = []
     retrieval_summary_vecs = []
+    io_stats = _EncodeIOStats()
 
     pack_writer = None
     if kv_cache_dir is not None:
@@ -435,6 +460,7 @@ def encode_video(
 
                 print(f"[encode/kv] chunk={i} delta_seq_len={delta_seq_len} layers={len(delta_kv)}")
                 for layer_idx, (layer_k, layer_v) in enumerate(delta_kv):
+                    t_io = time.time()
                     rec = pack_writer.append_block(
                         frame_index=i,
                         layer_index=layer_idx,
@@ -448,6 +474,7 @@ def encode_video(
                     rec["block_index"] = len(chunk_records)
                     rec["delta_seq_len"] = int(delta_seq_len)
                     chunk_records.append(rec)
+                    io_stats.record(rec.get("payload_len", 0), time.time() - t_io)
                     if layer_idx == 0:
                         print(
                             f"[encode/kv] wrote chunk={i} layer={layer_idx} "
@@ -482,6 +509,7 @@ def encode_video(
         if pack_writer is not None:
             pack_writer.write_index(common_metadata)
             pack_writer.close()
+        print(io_stats.summary())
         _write_chunk_manifest(kv_cache_dir, chunk_records, common_metadata)
         _write_retrieval_index(
             kv_cache_dir,

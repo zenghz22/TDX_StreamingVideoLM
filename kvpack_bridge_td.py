@@ -56,6 +56,37 @@ REQUEST_TIMEOUT = 60.0
 SEP = b"\x00RECJSON:"   # block 字节与 rec JSON 的分隔符
 
 
+class _BridgeStats:
+    """轻量运行时监控：累计时延、吞吐、单次传输大小。"""
+    def __init__(self, stage: str):
+        self.stage = stage
+        self.n = 0
+        self.bytes_total = 0
+        self.seconds_total = 0.0
+        self.max_bytes = 0
+        self.min_bytes = None
+
+    def record(self, size_bytes: int, seconds: float):
+        self.n += 1
+        self.bytes_total += int(size_bytes)
+        self.seconds_total += float(seconds)
+        self.max_bytes = max(self.max_bytes, int(size_bytes))
+        self.min_bytes = int(size_bytes) if self.min_bytes is None else min(self.min_bytes, int(size_bytes))
+
+    def summary(self) -> str:
+        if self.n == 0:
+            return f"[bridge/stats:{self.stage}] no transfers"
+        avg_bytes = self.bytes_total / self.n
+        avg_ms = (self.seconds_total / self.n) * 1000
+        bw_mbps = (self.bytes_total / (1024 * 1024)) / self.seconds_total if self.seconds_total > 0 else 0.0
+        return (
+            f"[bridge/stats:{self.stage}] n={self.n}  total={self.bytes_total/1024/1024:.2f}MB  "
+            f"time={self.seconds_total:.3f}s  bw={bw_mbps:.2f}MB/s  "
+            f"avg={avg_bytes/1024:.1f}KB/{avg_ms:.2f}ms  "
+            f"min={self.min_bytes/1024:.1f}KB  max={self.max_bytes/1024:.1f}KB"
+        )
+
+
 def is_bridge_available() -> bool:
     if not os.path.exists(SHM_FILE_PATH):
         return False
@@ -115,6 +146,7 @@ class KVPackBridgeWriter:
         self._kv_dir = kv_cache_dir
         self._fd, self._mm = _open_shm()
         self.records = []   # 本地记录 rec 元数据（不含原始字节）
+        self._stats = _BridgeStats("encode_offload")
         # 复用 KVPackWriter 的序列化逻辑
         from kvpack_mmap_td import KVPackWriter as _W
         # 用一个内存 dummy 文件模拟写，只取序列化字节
@@ -140,6 +172,7 @@ class KVPackBridgeWriter:
             )
 
         _wait_idle(mm, REQUEST_TIMEOUT)
+        t0 = time.time()
         print(f"[bridge/td] OFFLOAD send L={rec.get('layer_index')} F={rec.get('frame_index')} bytes={len(payload)}")
         mm[PAGESIZE : PAGESIZE + len(payload)] = payload
         FMT_FRAME.pack_into(mm, OFF_FRAME, rec.get("frame_index", 0))
@@ -158,6 +191,7 @@ class KVPackBridgeWriter:
                 raise TimeoutError("OFFLOAD timed out")
 
         err = FMT_ERR.unpack_from(mm, OFF_ERR_FLAG)[0]
+        self._stats.record(len(payload), time.time() - t0)
         if err:
             raise RuntimeError(
                 f"Host OFFLOAD error for (L={rec.get('layer_index')}, "
@@ -193,6 +227,7 @@ class KVPackBridgeWriter:
             raise ValueError("common_metadata too large for bridge")
 
         _wait_idle(mm, REQUEST_TIMEOUT)
+        t0 = time.time()
         print(f"[bridge/td] FINALIZE send metadata bytes={len(meta_bytes)}")
         mm[PAGESIZE : PAGESIZE + len(meta_bytes)] = meta_bytes
         FMT_DATALEN.pack_into(mm, OFF_DATA_LEN, len(meta_bytes))
@@ -202,11 +237,14 @@ class KVPackBridgeWriter:
 
         _wait_response(mm, REQUEST_TIMEOUT)
         err = FMT_ERR.unpack_from(mm, OFF_ERR_FLAG)[0]
+        finalize_sec = time.time() - t0
         mm[OFF_STATUS] = STATUS_IDLE
         mm.flush()
         if err:
             raise RuntimeError("Host FINALIZE failed")
         print(f"[bridge/td] FINALIZE done: {len(self.records)} blocks offloaded.")
+        print(self._stats.summary())
+        print(f"[bridge/stats:finalize] metadata={len(meta_bytes)}B time={finalize_sec*1000:.2f}ms")
 
     def close(self) -> None:
         if self._mm:
@@ -229,6 +267,7 @@ class KVPackBridgeClient:
         self._crypto_ctx = crypto_ctx
         self._timeout    = timeout
         self._fd, self._mm = _open_shm()
+        self._stats = _BridgeStats("decode_fetch")
 
         index_path = os.path.join(kv_cache_dir, "kvpack_index.json")
         with open(index_path, "r", encoding="utf-8") as f:
@@ -278,6 +317,7 @@ class KVPackBridgeClient:
             raise RuntimeError(f"Host FETCH error: {raw.decode('utf-8', errors='replace')}")
 
         t_ms = (time.time() - t0) * 1000
+        self._stats.record(dlen, t_ms / 1000)
         print(f"[bridge/td] fetch (L={layer_index},F={frame_index}) "
               f"{dlen//1024}KB  {t_ms:.1f}ms")
 
@@ -330,6 +370,7 @@ class KVPackBridgeClient:
         return k.to(map_location), v.to(map_location), header
 
     def close(self) -> None:
+        print(self._stats.summary())
         if self._mm:
             self._mm.close()
         if self._fd:

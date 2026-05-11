@@ -2,10 +2,35 @@
 
 import json
 import os
+import time
 
 import torch
 from safetensors import safe_open
 from kvpack_mmap_td import KVPackReader, has_kvpack
+
+
+class _DecodeIOStats:
+    """统计 decode 阶段 KV 读取 I/O 总开销。"""
+    def __init__(self):
+        self.blocks = 0
+        self.bytes_total = 0
+        self.seconds_total = 0.0
+
+    def record(self, payload_len: int, seconds: float):
+        self.blocks += 1
+        self.bytes_total += int(payload_len)
+        self.seconds_total += float(seconds)
+
+    def summary(self) -> str:
+        if self.blocks == 0:
+            return "[decode/io-stats] no KV blocks loaded."
+        bw = (self.bytes_total / (1024 * 1024)) / self.seconds_total if self.seconds_total > 0 else 0.0
+        avg_kb = (self.bytes_total / self.blocks) / 1024
+        avg_ms = (self.seconds_total / self.blocks) * 1000
+        return (
+            f"[decode/io-stats] blocks={self.blocks} total={self.bytes_total/1024/1024:.2f}MB "
+            f"time={self.seconds_total:.3f}s bw={bw:.2f}MB/s avg={avg_kb:.1f}KB/{avg_ms:.2f}ms"
+        )
 
 
 def _to_model_cache(past_key_values):
@@ -214,6 +239,7 @@ def _assemble_per_layer_kv(
     # 并行模式（parallel_workers>1）：所有 (layer, frame) 对同时解密
     try:
         n_layers = len(per_layer_chunk_indices)
+        io_stats = _DecodeIOStats()
 
         if crypto_ctx is not None and getattr(crypto_ctx, "enabled", False) and \
                 getattr(crypto_ctx, "parallel_workers", 1) > 1:
@@ -227,12 +253,14 @@ def _assemble_per_layer_kv(
             print(f"[retrieve] assemble_per_layer_kv serial load: layers={n_layers}")
             for L_idx in range(n_layers):
                 for frame_idx in per_layer_chunk_indices[L_idx]:
+                    t_io = time.time()
                     rec = reader.by_layer_frame[(L_idx, int(frame_idx))]
                     header = reader._read_header(rec)
                     off = int(rec["offset"])
                     hlen = int(rec["header_len"])
                     pstart = off + _BLOCK_HEAD.size + hlen
                     raw_blob = bytes(reader._mmap[pstart : pstart + int(rec["payload_len"])])
+                    io_stats.record(rec.get("payload_len", 0), time.time() - t_io)
                     all_tasks.append((L_idx, int(frame_idx), raw_blob, header))
 
             t_read_done = time.time()
@@ -298,11 +326,14 @@ def _assemble_per_layer_kv(
                     raise ValueError(f"layer {L_idx} has empty chunk selection")
                 k_list, v_list = [], []
                 for frame_idx in selected:
+                    t_io = time.time()
                     k, v, _ = reader.read_layer_frame(
                         L_idx, int(frame_idx),
                         map_location=map_location,
                         decrypt_fn=decrypt_payload_fn,
                     )
+                    rec_meta = reader.by_layer_frame.get((L_idx, int(frame_idx)), {})
+                    io_stats.record(rec_meta.get("payload_len", 0), time.time() - t_io)
                     k_list.append(k)
                     v_list.append(v)
                 K_cat = torch.cat(k_list, dim=-2)
@@ -352,6 +383,7 @@ def _assemble_per_layer_kv(
         f"[assemble_per_layer_kv] Loaded {len(union_ids)} unique chunk files, "
         f"assembled {n_layers} layers × {past_seq_len} tokens."
     )
+    print(io_stats.summary())
     return tuple(per_layer_kv), past_seq_len
 
 

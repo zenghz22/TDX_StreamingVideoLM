@@ -142,11 +142,9 @@ def run_host(kv_dir: str, verbose: bool = False) -> None:
                 continue   # busy-wait
             if status == STATUS_RESPONSE_READY:
                 # 仅 TD 侧应消费 RESPONSE_READY 并回写 IDLE。
-                # 若 host 读到该状态，说明存在竞态/残留状态，host 不应把它当新请求处理。
-                mm[OFF_STATUS] = STATUS_IDLE
-                mm.flush()
+                # host 看到该状态时只能等待，不能主动改写，否则 TD 侧可能错过响应并超时。
                 if verbose:
-                    print("[host] cleared stale RESPONSE_READY -> IDLE")
+                    print("[host] observed RESPONSE_READY; waiting TD ack")
                 continue
 
             mm[OFF_STATUS] = STATUS_HOST_BUSY

@@ -65,7 +65,7 @@ if __name__ == "__main__":
             processor, model = load_model(model_path, load_weights=True)
             inject_timing_hook_to_model(model, event_callback=monitor["mark"])
 
-            video = load_video(video_path, sample_fps=0.5)
+            video = load_video(video_path, sample_fps=0.05)
 
             monitor["mark"]("kvcache_encode_start")
             encode_video(
