@@ -166,6 +166,7 @@ def _assemble_per_layer_kv(
     *,
     crypto_ctx=None,
     map_location: str = "cpu",
+    td_cache=None,             # 可选: kvpack_cache_td.TDBlockCache
 ):
     """
     ReKV per-layer 独立检索的加载层：每层从各自选出的 chunk 集合里拼装 KV。
@@ -206,6 +207,24 @@ def _assemble_per_layer_kv(
     else:
         reader = KVPackReader(kv_cache_dir)
         print(f"[retrieve] Using direct mmap mode (no bridge host detected), kv_dir={kv_cache_dir}.")
+
+    # ── TD 缓存透明拦截 ────────────────────────────────────────────────
+    # 命中时省去 SHM 往返 + 解密 + numpy→torch 转换;
+    # 注意:crypto.parallel_workers>1 的批量解密路径直接访问 reader._mmap,
+    # 会绕过本 cache。Phase 1 暂不处理那条路径(默认 parallel_workers=1)。
+    if td_cache is not None:
+        from kvpack_cache_td import CachingReader
+        if crypto_ctx is not None and getattr(crypto_ctx, "parallel_workers", 1) > 1:
+            print(
+                f"[retrieve] WARNING: td_cache is set but parallel_workers>1; "
+                f"the parallel decrypt path bypasses cache."
+            )
+        reader = CachingReader(reader, td_cache)
+        print(
+            f"[retrieve] wrapped reader with TDBlockCache "
+            f"(policy={td_cache.policy.describe()}, capacity={td_cache.capacity}, "
+            f"resident={len(td_cache)} blocks)"
+        )
     # ── Bug fix：num_layers 必须与 encrypt_fn 里的值完全相同，
     # 否则 layer_frame_block_id = frame * num_layers + layer 产生不同值 → HKDF 派生不同密钥 → 解密失败
     # 正确来源：kvpack_index.json 的 common_metadata["num_layers"]，与 encode 阶段写入的值一致
@@ -530,6 +549,7 @@ def decode_kvcache(
     decode_strategy="sample",
     suffix=None,
     crypto_ctx=None,
+    td_cache=None,                # 可选: kvpack_cache_td.TDBlockCache
 ):
     """加载 KV cache，直接文本解码，跳过视频预处理与编码。
 
@@ -574,7 +594,8 @@ def decode_kvcache(
         # 逐层加载各自的 chunk KV
         video_kv, video_seq_len = _assemble_per_layer_kv(
             kv_cache_path, per_layer_chunk_indices,
-            crypto_ctx=crypto_ctx, map_location="cpu"
+            crypto_ctx=crypto_ctx, map_location="cpu",
+            td_cache=td_cache,
         )
 
         # 拼 prefix + video，逐层拼接（所有层 prefix 相同）

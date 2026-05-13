@@ -241,6 +241,7 @@ def encode_video(
     crypto_ctx=None,              # 可选：kvcache_crypto_td.CryptoContext
     max_in_memory: int = 64,
     window_size: Optional[int] = None,
+    td_cache=None,                # 可选：kvpack_cache_td.TDBlockCache
 ):
     """将视频分块编码成 KV cache（全部存 I 帧，无差分压缩）。"""
     num_frames = video.shape[0]
@@ -475,6 +476,13 @@ def encode_video(
                     rec["delta_seq_len"] = int(delta_seq_len)
                     chunk_records.append(rec)
                     io_stats.record(rec.get("payload_len", 0), time.time() - t_io)
+
+                    # ── encode 端 pre-warm:把刚算出的明文 (K, V) 喂给 TD 缓存
+                    # encrypt-offload 已经完成,这里只是额外把同样的张量在内存里
+                    # 留一份引用;策略决定是否真的接纳。
+                    if td_cache is not None:
+                        td_cache.maybe_admit(layer_idx, i, layer_k, layer_v, rec)
+
                     if layer_idx == 0:
                         print(
                             f"[encode/kv] wrote chunk={i} layer={layer_idx} "
