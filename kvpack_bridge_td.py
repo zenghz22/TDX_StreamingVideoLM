@@ -26,7 +26,8 @@ import numpy as np
 import torch
 
 # ── 协议常量（与 kvpack_bridge_host.py 完全一致）────────────────────────────
-SHM_FILE_PATH   = "/dev/shm/kvbridge_shmem"
+#SHM_FILE_PATH   = "/dev/shm/kvbridge_shmem"
+SHM_FILE_PATH   = "/sys/bus/pci/devices/0000:00:03.0/resource2"   # TDX 特定路径
 PAGESIZE        = os.sysconf("SC_PAGE_SIZE")
 
 OFF_STATUS      = 0
@@ -193,10 +194,14 @@ class KVPackBridgeWriter:
         err = FMT_ERR.unpack_from(mm, OFF_ERR_FLAG)[0]
         self._stats.record(len(payload), time.time() - t0)
         if err:
-            raise RuntimeError(
-                f"Host OFFLOAD error for (L={rec.get('layer_index')}, "
-                f"F={rec.get('frame_index')}), status={int(mm[OFF_STATUS])}"
-            )
+            raise RuntimeError("Host FINALIZE failed")
+        # ── 关键修复:TD 侧也落一份本地 kvpack_index.json ──────────────
+        # 真机下 TD 与 host 是两套文件系统;host 写的索引在 host 侧,
+        # 而 TD 解码(KVPackBridgeClient)需在本地读取该索引以获得块结构与
+        # common_metadata。TD 已在 self.records 持有全部块记录,直接落盘即可。
+        # 注:解码按 (layer,frame) 取回、由 host 解析真实 offset,本地索引的
+        #     offset 字段仅为占位,不参与取回,无需与 host 一致。
+        print(f"[bridge/td] FINALIZE done: {len(self.records)} blocks offloaded.")
 
     def append_block(self, *, frame_index, layer_index, seq_start, seq_end,
                      key_tensor, value_tensor, encrypt_fn=None) -> dict:
@@ -220,7 +225,7 @@ class KVPackBridgeWriter:
         return rec
 
     def write_index(self, common_metadata: dict) -> None:
-        """encode 结束：通知宿主写 kvpack_index.json。"""
+        """encode 结束：通知宿主写 kvpack_index.json，并在 TD 侧落一份本地索引。"""
         mm = self._mm
         meta_bytes = json.dumps(common_metadata, ensure_ascii=False).encode()
         if len(meta_bytes) > MAX_BLOCK_BYTES:
@@ -242,9 +247,28 @@ class KVPackBridgeWriter:
         mm.flush()
         if err:
             raise RuntimeError("Host FINALIZE failed")
+
+        # ── 关键修复:TD 侧也落一份本地 kvpack_index.json（解码自给自足）──
+        self._write_local_index(common_metadata)
+
         print(f"[bridge/td] FINALIZE done: {len(self.records)} blocks offloaded.")
         print(self._stats.summary())
         print(f"[bridge/stats:finalize] metadata={len(meta_bytes)}B time={finalize_sec*1000:.2f}ms")
+
+    def _write_local_index(self, common_metadata: dict) -> None:
+        os.makedirs(self._kv_dir, exist_ok=True)
+        local_index_path = os.path.join(self._kv_dir, "kvpack_index.json")
+        payload = {
+            "format": "kvpack_mmap_v1",
+            "data_file": "kvpack.bin",   # 实际驻留 host;TD 侧仅作标识
+            "num_blocks": len(self.records),
+            "blocks": self.records,
+            "common_metadata": common_metadata,
+        }
+        with open(local_index_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"[bridge/td] local kvpack_index.json written: "
+              f"{local_index_path} ({len(self.records)} blocks)")
 
     def close(self) -> None:
         if self._mm:

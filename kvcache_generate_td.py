@@ -62,7 +62,7 @@ def _get_cache_seq_len(kv_cache):
 
 def load_model(model_name="llava-hf/llava-onevision-qwen2-7b-ov-hf", load_weights=False):
     """加载 processor；可选加载模型权重。"""
-    processor = LlavaOnevisionProcessor.from_pretrained(model_name)
+    processor = LlavaOnevisionProcessor.from_pretrained(model_name, trust_remote_code=False)
     model = None
     if load_weights:
         model = LlavaOV.from_pretrained(model_name, trust_remote_code=True)
