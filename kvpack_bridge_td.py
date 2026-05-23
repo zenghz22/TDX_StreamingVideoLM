@@ -11,11 +11,23 @@ decode 阶段：通过 FETCH 协议向宿主请求 (layer, frame) block，
   KVPackBridgeWriter  : 替代 KVPackWriter，encode 阶段使用
   KVPackBridgeClient  : 替代 KVPackReader，decode 阶段使用
   is_bridge_available : 检测宿主是否就绪
+
+监控
+----
+本文件使用 zhz_bridge_eval_utils.BridgeMonitor 记录每次 OFFLOAD / FETCH
+/ FINALIZE 的三阶段计时（wait_idle / data_copy / wait_response），并在
+encode 完成（write_index）或 decode 关闭（close）时打印分组汇总。
+
+环境变量
+  BRIDGE_MONITOR_JSONL_DIR : 若设置，每个 monitor 会把详细记录写到
+      ${BRIDGE_MONITOR_JSONL_DIR}/<name>_<side>.jsonl
+  BRIDGE_MONITOR_DISABLE   : 若设置为 "1"，关闭监控（接口仍兼容，0 开销）
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import mmap
 import os
 import struct
@@ -24,6 +36,10 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
+
+from zhz_bridge_eval_utils import make_monitor
+
+logger = logging.getLogger(__name__)
 
 # ── 协议常量（与 kvpack_bridge_host.py 完全一致）────────────────────────────
 #SHM_FILE_PATH   = "/dev/shm/kvbridge_shmem"
@@ -57,35 +73,17 @@ REQUEST_TIMEOUT = 60.0
 SEP = b"\x00RECJSON:"   # block 字节与 rec JSON 的分隔符
 
 
-class _BridgeStats:
-    """轻量运行时监控：累计时延、吞吐、单次传输大小。"""
-    def __init__(self, stage: str):
-        self.stage = stage
-        self.n = 0
-        self.bytes_total = 0
-        self.seconds_total = 0.0
-        self.max_bytes = 0
-        self.min_bytes = None
+# ── 全局监控开关 ───────────────────────────────────────────────────────────
 
-    def record(self, size_bytes: int, seconds: float):
-        self.n += 1
-        self.bytes_total += int(size_bytes)
-        self.seconds_total += float(seconds)
-        self.max_bytes = max(self.max_bytes, int(size_bytes))
-        self.min_bytes = int(size_bytes) if self.min_bytes is None else min(self.min_bytes, int(size_bytes))
+_MONITOR_ENABLED = os.environ.get("BRIDGE_MONITOR_DISABLE", "0") != "1"
+_MONITOR_JSONL_DIR = os.environ.get("BRIDGE_MONITOR_JSONL_DIR", "").strip() or None
 
-    def summary(self) -> str:
-        if self.n == 0:
-            return f"[bridge/stats:{self.stage}] no transfers"
-        avg_bytes = self.bytes_total / self.n
-        avg_ms = (self.seconds_total / self.n) * 1000
-        bw_mbps = (self.bytes_total / (1024 * 1024)) / self.seconds_total if self.seconds_total > 0 else 0.0
-        return (
-            f"[bridge/stats:{self.stage}] n={self.n}  total={self.bytes_total/1024/1024:.2f}MB  "
-            f"time={self.seconds_total:.3f}s  bw={bw_mbps:.2f}MB/s  "
-            f"avg={avg_bytes/1024:.1f}KB/{avg_ms:.2f}ms  "
-            f"min={self.min_bytes/1024:.1f}KB  max={self.max_bytes/1024:.1f}KB"
-        )
+
+def _make_jsonl_path(name: str, side: str) -> Optional[str]:
+    """根据 env 拼一个 monitor 专属的 jsonl 路径，未配置则返回 None。"""
+    if not _MONITOR_JSONL_DIR:
+        return None
+    return os.path.join(_MONITOR_JSONL_DIR, f"{name}_{side}.jsonl")
 
 
 def is_bridge_available() -> bool:
@@ -96,7 +94,7 @@ def is_bridge_available() -> bool:
         mm = mmap.mmap(fd, PAGESIZE, mmap.MAP_SHARED, mmap.PROT_READ)
         status = mm[OFF_STATUS]
         mm.close(); os.close(fd)
-        # host may transiently stay in busy/response states; treat any non-shutdown as available
+        # host 可能短暂处于 busy/response 状态；只要不是 SHUTDOWN 都视为可用
         return status != STATUS_SHUTDOWN
     except Exception:
         return False
@@ -113,14 +111,18 @@ def _wait_idle(mm: mmap.mmap, timeout: float) -> None:
     t0 = time.time()
     while mm[OFF_STATUS] != STATUS_IDLE:
         if time.time() - t0 > timeout:
-            raise TimeoutError(f"Bridge host not responding, status={int(mm[OFF_STATUS])}")
+            raise TimeoutError(
+                f"Bridge host not responding, status={int(mm[OFF_STATUS])}"
+            )
 
 
 def _wait_response(mm: mmap.mmap, timeout: float) -> None:
     t0 = time.time()
     while mm[OFF_STATUS] != STATUS_RESPONSE_READY:
         if time.time() - t0 > timeout:
-            raise TimeoutError(f"Bridge host response timed out, status={int(mm[OFF_STATUS])}")
+            raise TimeoutError(
+                f"Bridge host response timed out, status={int(mm[OFF_STATUS])}"
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -130,13 +132,15 @@ def _wait_response(mm: mmap.mmap, timeout: float) -> None:
 class KVPackBridgeWriter:
     """
     替代 KVPackWriter，encode 阶段每个 block 写完后立即 offload 给宿主。
-    接口与 KVPackWriter 完全相同（append_block / append_p_block / write_index / close）。
+    接口与 KVPackWriter 完全相同（append_block / write_index / close）。
 
-    原理：
-      - 调用 append_block / append_p_block 时，先在 TD 侧完成序列化（含加密），
-        然后通过 OFFLOAD 协议将字节推送给宿主，宿主追加写入 kvpack.bin。
-      - encode 完成后调用 write_index，通过 FINALIZE 协议通知宿主写 kvpack_index.json。
-      - TD 侧不保存任何 block 字节到本地磁盘，实现真正的 offload。
+    监控
+    ----
+    每次 _offload_block 在 BridgeMonitor 中记录三段时间：
+      - t_wait_idle_us     : 等宿主回到 IDLE
+      - t_data_copy_us     : 把 payload 写入 SHM 数据页 + 控制字段 + flush
+      - t_wait_response_us : 宿主完成磁盘写入并回 IDLE 的耗时
+    write_index 另外记录一次 FINALIZE op，最后调用 log_summary。
     """
 
     def __init__(self, kv_cache_dir: str):
@@ -147,21 +151,30 @@ class KVPackBridgeWriter:
         self._kv_dir = kv_cache_dir
         self._fd, self._mm = _open_shm()
         self.records = []   # 本地记录 rec 元数据（不含原始字节）
-        self._stats = _BridgeStats("encode_offload")
-        # 复用 KVPackWriter 的序列化逻辑
+        self._monitor = make_monitor(
+            "encode_offload",
+            side="td",
+            enabled=_MONITOR_ENABLED,
+            logger=logger,
+            jsonl_path=_make_jsonl_path("encode_offload", "td"),
+            progress_every_n=50,
+            progress_every_sec=0.0,
+        )
+        # 复用 KVPackWriter 的序列化逻辑（写到内存 BytesIO，不落盘）
         from kvpack_mmap_td import KVPackWriter as _W
-        # 用一个内存 dummy 文件模拟写，只取序列化字节
         import io
         self._dummy_writer = _W.__new__(_W)
         self._dummy_writer._f = io.BytesIO()
         self._dummy_writer.records = []
-        print(f"[bridge/td] KVPackBridgeWriter ready, offloading to host. kv_dir={kv_cache_dir}")
+        logger.info(
+            f"[bridge/td] KVPackBridgeWriter ready, offloading to host. "
+            f"kv_dir={kv_cache_dir}"
+        )
 
     def _offload_block(self, block_bytes: bytes, rec: dict) -> None:
         """
         把一个 block 的字节推送给宿主，等待宿主存盘确认。
         payload = block_bytes + SEP + rec_json
-        宿主会从中分离出 block_bytes 和 rec，确定实际文件偏移后写入。
         """
         mm = self._mm
         rec_json = json.dumps(rec, ensure_ascii=False, separators=(",", ":")).encode()
@@ -169,7 +182,8 @@ class KVPackBridgeWriter:
 
         if len(payload) > MAX_BLOCK_BYTES:
             raise ValueError(
-                f"Block payload {len(payload)} bytes exceeds MAX_BLOCK_BYTES={MAX_BLOCK_BYTES}"
+                f"Block payload {len(payload)} bytes exceeds "
+                f"MAX_BLOCK_BYTES={MAX_BLOCK_BYTES}"
             )
 
         _wait_idle(mm, REQUEST_TIMEOUT)
@@ -206,7 +220,6 @@ class KVPackBridgeWriter:
     def append_block(self, *, frame_index, layer_index, seq_start, seq_end,
                      key_tensor, value_tensor, encrypt_fn=None) -> dict:
         """与 KVPackWriter.append_block 接口完全相同。"""
-        # 借用 dummy writer 序列化
         dw = self._dummy_writer
         dw._f.seek(0)
         dw._f.truncate(0)
@@ -271,6 +284,10 @@ class KVPackBridgeWriter:
               f"{local_index_path} ({len(self.records)} blocks)")
 
     def close(self) -> None:
+        try:
+            self._monitor.close()
+        except Exception:
+            pass
         if self._mm:
             self._mm.close()
         if self._fd:
@@ -278,11 +295,20 @@ class KVPackBridgeWriter:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Decode 侧：KVPackBridgeClient（与之前相同，fetch 协议）
+# Decode 侧：KVPackBridgeClient
 # ══════════════════════════════════════════════════════════════════════════════
 
 class KVPackBridgeClient:
-    """替代 KVPackReader，decode 阶段通过 FETCH 协议向宿主请求 block。"""
+    """替代 KVPackReader，decode 阶段通过 FETCH 协议向宿主请求 block。
+
+    监控
+    ----
+    每次 read_layer_frame 在 BridgeMonitor 中记录三段时间：
+      - t_wait_idle_us     : 等宿主 IDLE
+      - t_data_copy_us     : 写请求字段（很小） + 后续从 SHM 读响应
+      - t_wait_response_us : 宿主磁盘读取并写回响应的耗时
+    close() 时自动 log_summary。
+    """
 
     def __init__(self, kv_cache_dir: str, crypto_ctx=None,
                  timeout: float = REQUEST_TIMEOUT):
@@ -291,7 +317,15 @@ class KVPackBridgeClient:
         self._crypto_ctx = crypto_ctx
         self._timeout    = timeout
         self._fd, self._mm = _open_shm()
-        self._stats = _BridgeStats("decode_fetch")
+        self._monitor = make_monitor(
+            "decode_fetch",
+            side="td",
+            enabled=_MONITOR_ENABLED,
+            logger=logger,
+            jsonl_path=_make_jsonl_path("decode_fetch", "td"),
+            progress_every_n=50,
+            progress_every_sec=0.0,
+        )
 
         index_path = os.path.join(kv_cache_dir, "kvpack_index.json")
         with open(index_path, "r", encoding="utf-8") as f:
@@ -306,10 +340,12 @@ class KVPackBridgeClient:
             self.by_layer_frame[key] = b
             self.frames.setdefault(int(b["frame_index"]), []).append(b)
 
-        print(f"[bridge/td] KVPackBridgeClient: "
-              f"{len(self.by_layer_frame)} blocks, "
-              f"crypto={'on' if crypto_ctx and crypto_ctx.enabled else 'off'}, "
-              f"num_layers={self._num_layers}, timeout={self._timeout}s")
+        logger.info(
+            f"[bridge/td] KVPackBridgeClient: "
+            f"{len(self.by_layer_frame)} blocks, "
+            f"crypto={'on' if crypto_ctx and crypto_ctx.enabled else 'off'}, "
+            f"num_layers={self._num_layers}, timeout={self._timeout}s"
+        )
 
     def read_layer_frame(self, layer_index: int, frame_index: int,
                          *, map_location: str = "cpu",
@@ -319,31 +355,50 @@ class KVPackBridgeClient:
         if key not in self.by_layer_frame:
             raise KeyError(f"block (L={layer_index},F={frame_index}) not in index")
 
-        t0 = time.time()
-        _wait_idle(mm, self._timeout)
-        print(f"[bridge/td] FETCH request L={layer_index} F={frame_index}")
+        # 先用 0 占位 payload_bytes，读到响应后再回填
+        with self._monitor.measure(
+            op="FETCH",
+            layer_index=int(layer_index), frame_index=int(frame_index),
+            payload_bytes=0,
+        ) as op_rec:
+            # ── 阶段 1: wait_idle ─────────────────────────────────────────
+            t0 = time.perf_counter_ns()
+            _wait_idle(mm, self._timeout)
+            t_after_wait = time.perf_counter_ns()
+            op_rec.t_wait_idle_us = (t_after_wait - t0) / 1000.0
 
-        FMT_FRAME.pack_into(mm, OFF_FRAME, frame_index)
-        FMT_LAYER.pack_into(mm, OFF_LAYER, layer_index)
-        mm.flush()
-        mm[OFF_STATUS] = STATUS_FETCH_READY
-        mm.flush()
+            # ── 阶段 2a: 写请求字段（仅 layer + frame）─────────────────────
+            FMT_FRAME.pack_into(mm, OFF_FRAME, frame_index)
+            FMT_LAYER.pack_into(mm, OFF_LAYER, layer_index)
+            mm.flush()
+            mm[OFF_STATUS] = STATUS_FETCH_READY
+            mm.flush()
+            t_after_send = time.perf_counter_ns()
+            t_send_us = (t_after_send - t_after_wait) / 1000.0
 
-        _wait_response(mm, self._timeout)
+            # ── 阶段 3: wait_response（宿主磁盘读取并写回响应）───────────
+            _wait_response(mm, self._timeout)
+            t_after_resp = time.perf_counter_ns()
+            op_rec.t_wait_response_us = (t_after_resp - t_after_send) / 1000.0
 
-        dlen  = FMT_DATALEN.unpack_from(mm, OFF_DATA_LEN)[0]
-        err   = FMT_ERR.unpack_from(mm, OFF_ERR_FLAG)[0]
-        raw   = bytes(mm[PAGESIZE : PAGESIZE + dlen])
-        mm[OFF_STATUS] = STATUS_IDLE
-        mm.flush()
+            # ── 阶段 2b: 从 SHM 数据页读响应字节 ─────────────────────────
+            dlen = FMT_DATALEN.unpack_from(mm, OFF_DATA_LEN)[0]
+            err  = FMT_ERR.unpack_from(mm, OFF_ERR_FLAG)[0]
+            raw  = bytes(mm[PAGESIZE : PAGESIZE + dlen])
+            mm[OFF_STATUS] = STATUS_IDLE
+            mm.flush()
+            t_end = time.perf_counter_ns()
+            t_recv_us = (t_end - t_after_resp) / 1000.0
 
-        if err:
-            raise RuntimeError(f"Host FETCH error: {raw.decode('utf-8', errors='replace')}")
+            # data_copy 包含 TD→SHM 写请求 + SHM→TD 读响应（两次小拷贝）
+            op_rec.t_data_copy_us = t_send_us + t_recv_us
+            op_rec.t_total_us     = (t_end - t0) / 1000.0
+            op_rec.payload_bytes  = int(dlen)
 
-        t_ms = (time.time() - t0) * 1000
-        self._stats.record(dlen, t_ms / 1000)
-        print(f"[bridge/td] fetch (L={layer_index},F={frame_index}) "
-              f"{dlen//1024}KB  {t_ms:.1f}ms")
+            if err:
+                raise RuntimeError(
+                    f"Host FETCH error: {raw.decode('utf-8', errors='replace')}"
+                )
 
         return self._parse_raw(raw, layer_index, frame_index, map_location)
 
@@ -389,12 +444,20 @@ class KVPackBridgeClient:
                 k, v = k.view(torch.bfloat16), v.view(torch.bfloat16)
 
         else:
-            raise ValueError(f"Unsupported block_type={block_type!r}; only 'I' is supported in mainline mode")
+            raise ValueError(
+                f"Unsupported block_type={block_type!r}; "
+                f"only 'I' is supported in mainline mode"
+            )
 
         return k.to(map_location), v.to(map_location), header
 
     def close(self) -> None:
-        print(self._stats.summary())
+        try:
+            # decode 结束，打整体汇总
+            self._monitor.log_summary()
+            self._monitor.close()
+        except Exception:
+            pass
         if self._mm:
             self._mm.close()
         if self._fd:
