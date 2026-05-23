@@ -64,10 +64,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     model_path    = "llava-hf/llava-onevision-qwen2-7b-ov-hf"
-    video_path    = "../data/haimian_7.mp4"
+    #video_path    = "../data/haimian_7.mp4"
+    video_path    = "../data/needle_4.mp4"
     kv_cache_path = "../data/kv_cache_chunks"
-    question      = "Who is in the video, and what are they doing?"
-    questions_file = "../data/haimian_7.json"
+    #question      = "Who is in the video, and what are they doing?"
+    question      = "What is the man in the black silhouette wearing on the lake shore?"
     encode_prefix = "You are a helpful assistant. Please understand the video content and prepare to answer single-choice questions."
 
 
@@ -79,12 +80,7 @@ if __name__ == "__main__":
         crypto_ctx = CryptoContext.from_key_file(args.key_file, create=True)
         logger.info(f"[crypto] Encryption enabled, key file: {args.key_file}")
 
-    # td_cache 在 main 作用域定义,跨 encode/decode 共享
-    # (decode-only 模式下保持 None,因 num_chunks 需要 video 来推算,且单 decode
-    #  无窗口内复用,cache 收益主要来自 encode 端 pre-warm)
-    td_cache = None
-
-    with measure_resources(args.mode, logger=logger, plot_file=args.plot_file, plot_lable=True) as monitor:
+    with measure_resources(args.mode, logger=logger, plot_file=args.plot_file, plot_lable=False) as monitor:
         # ── 编码阶段 ──
         if args.mode in ("encode_decode", "encode"):
             monitor["mark"]("load_model_encode")
